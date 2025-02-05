@@ -1,113 +1,69 @@
-// Shows how the WBL / getLastError logic depends on the actual chunks which are moved
-// We should probably either always wait for writebacks, or don't at all
+// Test write re-routing on version mismatch.
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-var st = new ShardingTest({ shards : 2, mongos : 2, verbose : 2, other : { separateConfig : true } })
+var st = new ShardingTest({shards: 2, mongos: 2});
 
-jsTest.log( "Doing test setup..." )
+var mongos = st.s;
+var admin = mongos.getDB("admin");
+var config = mongos.getDB("config");
+var coll = st.s.getCollection('TestDB.coll');
 
-// Stop balancer, since it'll just get in the way of this
-st.stopBalancer()
+assert.commandWorked(
+    mongos.adminCommand({enableSharding: 'TestDB', primaryShard: st.shard0.shardName}));
+assert.commandWorked(mongos.adminCommand({shardCollection: 'TestDB.coll', key: {_id: 1}}));
 
-var mongos = st.s
-var admin = mongos.getDB("admin")
-var config = mongos.getDB("config")
-var coll = st.s.getCollection( jsTest.name() + ".coll" )
+jsTest.log("Refreshing second mongos...");
 
-st.shardColl( coll, { _id : 1 }, { _id : 0 }, false )
-
-jsTest.log( "Refreshing second mongos..." )
-
-var mongosB = st.s1
-var adminB = mongosB.getDB("admin")
-var collB = mongosB.getCollection( coll + "" )
+var mongosB = st.s1;
+var adminB = mongosB.getDB("admin");
+var collB = mongosB.getCollection(coll + "");
 
 // Make sure mongosB knows about the coll
-assert.eq( 0, collB.find().itcount() )
-// printjson( adminB.runCommand({ flushRouterConfig : 1 }) )
+assert.eq(0, collB.find().itcount());
 
-jsTest.log( "Moving chunk to create stale mongos..." )
+jsTest.log("Moving chunk to create stale mongos...");
+assert.commandWorked(
+    admin.runCommand({moveChunk: coll + "", find: {_id: 0}, to: st.shard1.shardName}));
 
-var otherShard = config.chunks.findOne({ _id : sh._collRE( coll ) }).shard
-for( var i = 0; i < st._shardNames.length; i++ ){
-    if( otherShard != st._shardNames[i] ){
-        otherShard = st._shardNames[i]
-        break
-    }
+jsTest.log("Inserting docs that needs to be retried...");
+
+var nextId = -1;
+for (var i = 0; i < 2; i++) {
+    printjson("Inserting " + nextId);
+    assert.commandWorked(collB.insert({_id: nextId--, hello: "world"}));
 }
 
-print( "Other shard : " + otherShard )
-
-printjson( admin.runCommand({ moveChunk : coll + "", find : { _id : 0 }, to : otherShard }) )
-
-jsTest.log( "Inserting docs to be written back..." )
-
-var nextId = -1
-// Create writebacks, could add more here
-for( var i = 0; i < 2; i++ ){
-    printjson( "Inserting " + nextId )
-    collB.insert({ _id : nextId--, hello : "world" })
-}
-
-// Refresh server
-printjson( adminB.runCommand({ flushRouterConfig : 1 }) )
-
-jsTest.log( "Inserting doc which successfully goes through..." )
+jsTest.log("Inserting doc which successfully goes through...");
 
 // Do second write
-collB.insert({ _id : nextId--, goodbye : "world" })
+assert.commandWorked(collB.insert({_id: nextId--, goodbye: "world"}));
 
-printjson( collB.getDB().getLastErrorObj() )
+// Assert that write went through
+assert.eq(coll.find().itcount(), 3);
 
-// Get error for last write
-//assert.eq( null, collB.getDB().getLastError() )
-
-jsTest.log( "GLE waited for the writebacks." )
- 
-// Assert that we waited for the writebacks...
-assert.eq( coll.find().itcount(), 3 )
-
-/*
-
-jsTest.log( "Waiting for the writeback..." )
-
-assert.soon(function(){
-    var count = coll.find().itcount()
-    print( "Count is : " + count )
-    return count == 3
-})
-
-*/
-
-jsTest.log( "Now try moving the actual chunk we're writing to..." )
+jsTest.log("Now try moving the actual chunk we're writing to...");
 
 // Now move the actual chunk we're writing to
-printjson( admin.runCommand({ moveChunk : coll + "", find : { _id : -1 }, to : otherShard }) )
+printjson(admin.runCommand({moveChunk: coll + "", find: {_id: -1}, to: st.shard1.shardName}));
 
-jsTest.log( "Inserting second docs to get written back..." )
+jsTest.log("Inserting second docs to get written back...");
 
-// Will fail entirely if too many of these, gle will wait too long
-for( var i = 0; i < 2; i++ ){
-    collB.insert({ _id : nextId--, hello : "world" })
+// Will fail entirely if too many of these, waiting for write to get applied can get too long.
+for (var i = 0; i < 2; i++) {
+    collB.insert({_id: nextId--, hello: "world"});
 }
 
 // Refresh server
-printjson( adminB.runCommand({ flushRouterConfig : 1 }) )
+printjson(adminB.runCommand({flushRouterConfig: 1}));
 
-jsTest.log( "Inserting second doc which successfully goes through..." )
+jsTest.log("Inserting second doc which successfully goes through...");
 
 // Do second write
-collB.insert({ _id : nextId--, goodbye : "world" })
+assert.commandWorked(collB.insert({_id: nextId--, goodbye: "world"}));
 
-jsTest.log( "GLE is now waiting for the writeback!" )
+jsTest.log("All docs written this time!");
 
-// Get error for last write
-assert.eq( null, collB.getDB().getLastError() )
+// Assert that writes went through.
+assert.eq(coll.find().itcount(), 6);
 
-jsTest.log( "All docs written this time!" )
-
-// Assert that we now waited for the writeback
-assert.eq( coll.find().itcount(), 6 )
-
-jsTest.log( "DONE" )
-
-st.stop() 
+st.stop();

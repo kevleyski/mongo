@@ -1,54 +1,182 @@
+/**
+ * Tests adding standalones and replica sets as shards under a variety of configurations (setName,
+ * valid and invalid hosts, shardName matching or not matching a setName, etc).
+ * @tags: [
+ *   # TODO (SERVER-97257): Re-enable this test.
+ *   # Test doesn't start enough mongods to have num_mongos routers
+ *   embedded_router_incompatible,
+ * ]
+ */
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {removeShard} from "jstests/sharding/libs/remove_shard_util.js";
 
-// don't start any shards, yet
-s = new ShardingTest( "add_shard2", 1, 0, 1, {useHostname : true} );
+// TODO SERVER-50144 Remove this and allow orphan checking.
+// This test calls removeShard which can leave docs in config.rangeDeletions in state "pending",
+// therefore preventing orphans from being cleaned up.
+TestData.skipCheckOrphans = true;
 
-var conn1 = startMongodTest( 30001 , "add_shard21" , 0 , {useHostname : true} );
-var conn2 = startMongodTest( 30002 , "add_shard22" , 0 , {useHostname : true} );
+let addShardRes;
 
-var rs1 = new ReplSetTest( { "name" : "add_shard2_rs1", nodes : 3 , startPort : 31200 } );
-rs1.startSet();
-rs1.initiate();
-var master1 = rs1.getMaster();
+const assertAddShardSucceeded = function(res, shardName) {
+    assert.commandWorked(res);
 
-var rs2 = new ReplSetTest( { "name" : "add_shard2_rs2", nodes : 3 , startPort : 31203 } );
-rs2.startSet();
-rs2.initiate();
-var master2 = rs2.getMaster();
+    // If a shard name was specified, make sure that the name the addShard command reports the
+    // shard was added with matches the specified name.
+    if (shardName) {
+        assert.eq(shardName,
+                  res.shardAdded,
+                  "name returned by addShard does not match name specified in addShard");
+    }
 
-// step 1. name given
-assert(s.admin.runCommand({"addshard" : getHostName()+":30001", "name" : "bar"}).ok, "failed to add shard in step 1");
-var shard = s.getDB("config").shards.findOne({"_id" : {"$nin" : ["shard0000"]}});
-assert(shard, "shard wasn't found");
-assert.eq("bar", shard._id, "shard has incorrect name");
+    // Make sure the shard shows up in config.shards with the shardName reported by the
+    // addShard command.
+    assert.neq(null,
+               st.s.getDB('config').shards.findOne({_id: res.shardAdded}),
+               "newly added shard " + res.shardAdded + " not found in config.shards");
+};
 
-// step 2. replica set
-assert(s.admin.runCommand({"addshard" : "add_shard2_rs1/"+getHostName()+":31200"}).ok, "failed to add shard in step 2");
-shard = s.getDB("config").shards.findOne({"_id" : {"$nin" : ["shard0000", "bar"]}});
-assert(shard, "shard wasn't found");
-assert.eq("add_shard2_rs1", shard._id, "t2 name");
+// Note: this method expects that the failure is *not* that the specified shardName is already
+// the shardName of an existing shard.
+const assertAddShardFailed = function(res, shardName) {
+    assert.commandFailed(res);
 
-// step 3. replica set w/ name given
-assert(s.admin.runCommand({"addshard" : "add_shard2_rs2/"+getHostName()+":31203", "name" : "myshard"}).ok,
-       "failed to add shard in step 4");
-shard = s.getDB("config").shards.findOne({"_id" : {"$nin" : ["shard0000", "bar", "add_shard2_rs1"]}});
-assert(shard, "shard wasn't found");
-assert.eq("myshard", shard._id, "t3 name");
+    // If a shard name was specified in the addShard, make sure no shard with its name shows up
+    // in config.shards.
+    if (shardName) {
+        if (TestData.configShard && shardName === "config") {
+            // In config shard mode there's always an entry for config for the config server.
+            assert.neq(null, st.s.getDB('config').shards.findOne({_id: shardName}));
+        } else {
+            assert.eq(null,
+                      st.s.getDB('config').shards.findOne({_id: shardName}),
+                      "addShard for " + shardName +
+                          " reported failure, but shard shows up in config.shards");
+        }
+    }
+};
 
-// step 4. no name given
-assert(s.admin.runCommand({"addshard" : getHostName()+":30002"}).ok, "failed to add shard in step 4");
-shard = s.getDB("config").shards.findOne({"_id" : {"$nin" : ["shard0000", "bar", "add_shard2_rs1", "myshard"]}});
-assert(shard, "shard wasn't found");
-assert.eq("shard0001", shard._id, "t4 name");
+const st = new ShardingTest({
+    shards: TestData.configShard ? 1 : 0,
+    mongos: 1,
+});
 
-assert.eq(s.getDB("config").shards.count(), 5, "unexpected number of shards");
+// Add one shard since the last shard cannot be removed.
+const normalShard = new ReplSetTest({name: "addshard2-1", nodes: 1, nodeOptions: {shardsvr: ""}});
+normalShard.startSet();
+normalShard.initiate();
 
-// step 5. replica set w/ a wrong host
-assert(!s.admin.runCommand({"addshard" : "add_shard2_rs2/NonExistingHost:31203"}).ok, "accepted bad hostname in step 5");
+st.s.adminCommand({addShard: normalShard.getURL(), name: 'normalShard'});
 
-// step 6. replica set w/ mixed wrong/right hosts
-assert(!s.admin.runCommand({"addshard" : "add_shard2_rs2/"+getHostName()+":31203,foo:9999"}).ok,
-       "accepted bad hostname in step 6");
+// Allocate a port that can be used to test adding invalid hosts.
+const portWithoutHostRunning = allocatePort();
 
-s.stop();
-rs1.stopSet();
-rs2.stopSet();
+// 1. Test adding a *replica set* with an ordinary set name
+
+// 1.a. with or without specifying the shardName.
+
+jsTest.log("Adding a replica set without a specified shardName should succeed.");
+const rst1 = new ReplSetTest({nodes: 1});
+rst1.startSet({shardsvr: ''});
+rst1.initiate();
+addShardRes = st.s.adminCommand({addShard: rst1.getURL()});
+assertAddShardSucceeded(addShardRes);
+assert.eq(rst1.name, addShardRes.shardAdded);
+removeShard(st, addShardRes.shardAdded);
+rst1.stopSet();
+
+jsTest.log(
+    "Adding a replica set with a specified shardName that matches the set's name should succeed.");
+const rst2 = new ReplSetTest({nodes: 1});
+rst2.startSet({shardsvr: ''});
+rst2.initiate();
+addShardRes = st.s.adminCommand({addShard: rst2.getURL(), name: rst2.name});
+assertAddShardSucceeded(addShardRes, rst2.name);
+removeShard(st, addShardRes.shardAdded);
+rst2.stopSet();
+
+let rst3 = new ReplSetTest({nodes: 1});
+rst3.startSet({shardsvr: ''});
+rst3.initiate();
+
+jsTest.log(
+    "Adding a replica set with a specified shardName that differs from the set's name should succeed.");
+addShardRes = st.s.adminCommand({addShard: rst3.getURL(), name: "differentShardName"});
+assertAddShardSucceeded(addShardRes, "differentShardName");
+removeShard(st, addShardRes.shardAdded);
+
+jsTest.log("Adding a replica with a specified shardName of 'config' should fail.");
+addShardRes = st.s.adminCommand({addShard: rst3.getURL(), name: "config"});
+assertAddShardFailed(addShardRes, "config");
+
+// 1.b. with invalid hostnames.
+
+jsTest.log("Adding a replica set with only non-existing hosts should fail.");
+addShardRes =
+    st.s.adminCommand({addShard: rst3.name + "/NonExistingHost:" + portWithoutHostRunning});
+assertAddShardFailed(addShardRes);
+
+jsTest.log("Adding a replica set with mixed existing/non-existing hosts should fail.");
+addShardRes = st.s.adminCommand({
+    addShard:
+        rst3.name + "/" + rst3.getPrimary().name + ",NonExistingHost:" + portWithoutHostRunning
+});
+assertAddShardFailed(addShardRes);
+
+rst3.stopSet();
+
+// 2. Test adding a replica set whose *set name* is "config" with or without specifying the
+// shardName.
+
+let rst4 = new ReplSetTest({name: "config", nodes: 1});
+rst4.startSet({shardsvr: ''});
+rst4.initiate();
+
+jsTest.log(
+    "Adding a replica set whose setName is config without specifying shardName should fail.");
+addShardRes = st.s.adminCommand({addShard: rst4.getURL()});
+assertAddShardFailed(addShardRes);
+
+jsTest.log(
+    "Adding a replica set whose setName is config with specified shardName 'config' should fail.");
+addShardRes = st.s.adminCommand({addShard: rst4.getURL(), name: rst4.name});
+assertAddShardFailed(addShardRes, rst4.name);
+
+jsTest.log(
+    "Adding a replica set whose setName is config with a non-'config' shardName should succeed");
+addShardRes = st.s.adminCommand({addShard: rst4.getURL(), name: "nonConfig"});
+assertAddShardSucceeded(addShardRes, "nonConfig");
+removeShard(st, addShardRes.shardAdded);
+
+rst4.stopSet();
+
+// 3. Test that a replica set whose *set name* is "admin" can be written to (SERVER-17232).
+
+let rst5 = new ReplSetTest({name: "admin", nodes: 1});
+rst5.startSet({shardsvr: ''});
+rst5.initiate();
+
+jsTest.log("A replica set whose set name is 'admin' should be able to be written to.");
+
+addShardRes = st.s.adminCommand({addShard: rst5.getURL()});
+assertAddShardSucceeded(addShardRes);
+
+// Ensure the write goes to the newly added shard.
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: 'test', primaryShard: addShardRes.shardAdded}));
+assert.commandWorked(st.s.getDB('test').runCommand({create: "foo"}));
+const res = st.s.getDB('config').getCollection('databases').findOne({_id: 'test'});
+assert.neq(null, res);
+assert.eq(res.primary, addShardRes.shardAdded);
+
+assert.commandWorked(st.s.getDB('test').foo.insert({x: 1}));
+assert.neq(null, rst5.getPrimary().getDB('test').foo.findOne());
+
+assert.commandWorked(st.s.getDB('test').runCommand({dropDatabase: 1}));
+
+removeShard(st, addShardRes.shardAdded);
+
+rst5.stopSet();
+
+st.stop();
+normalShard.stopSet();

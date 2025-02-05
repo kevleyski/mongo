@@ -31,6 +31,18 @@ using std::make_pair;
 
 static const unsigned char kCurrentEncodingVersionNumber = 1;
 
+namespace {
+  s2_env::StringStream& operator<<(s2_env::StringStream& strStream, const S1Angle& angle) {
+    std::stringstream ss;
+    ss << angle;
+    return strStream << ss.str();
+  }
+  // Reverse the output order of Lat/Lng to Lng/Lat
+  s2_env::StringStream& operator<<(s2_env::StringStream& strStream, const S2LatLng& ll) {
+      return strStream << "[" << ll.lng() << ", " << ll.lat() << "]";
+  }
+}
+
 S2Point const* S2LoopIndex::edge_from(int index) const {
   return &loop_->vertex(index);
 }
@@ -79,7 +91,9 @@ void S2Loop::Init(vector<S2Point> const& vertices) {
     vertices_ = NULL;
   } else {
     vertices_ = new S2Point[num_vertices_];
-    memcpy(vertices_, &vertices[0], num_vertices_ * sizeof(vertices_[0]));
+    // mongodb: void* casts to silence a -Wclass-memaccess warning.
+    memcpy(static_cast<void*>(vertices_), static_cast<const void*>(&vertices[0]),
+           num_vertices_ * sizeof(vertices_[0]));
   }
   owns_vertices_ = true;
   bound_ = S2LatLngRect::Full();
@@ -90,16 +104,18 @@ void S2Loop::Init(vector<S2Point> const& vertices) {
   InitBound();
 }
 
-bool S2Loop::IsValid() const {
+bool S2Loop::IsValid(string* err) const {
   // Loops must have at least 3 vertices.
   if (num_vertices() < 3) {
     VLOG(2) << "Degenerate loop";
+    if (err) *err = "Degenerate loop";
     return false;
   }
   // All vertices must be unit length.
   for (int i = 0; i < num_vertices(); ++i) {
     if (!S2::IsUnitLength(vertex(i))) {
       VLOG(2) << "Vertex " << i << " is not unit length";
+      if (err) *err = s2_env::StringStream() << "Vertex " << i << " is not unit length";
       return false;
     }
   }
@@ -108,6 +124,8 @@ bool S2Loop::IsValid() const {
   for (int i = 0; i < num_vertices(); ++i) {
     if (!vmap.insert(make_pair(vertex(i), i)).second) {
       VLOG(2) << "Duplicate vertices: " << vmap[vertex(i)] << " and " << i;
+      if (err) *err = s2_env::StringStream() << "Duplicate vertices: " << vmap[vertex(i)]
+          << " and " << i;
       return false;
     }
   }
@@ -131,11 +149,17 @@ bool S2Loop::IsValid() const {
         previous_index = ai + 1;
         if (crosses) {
           VLOG(2) << "Edges " << i << " and " << ai << " cross";
-          // additional debugging information:
-          VLOG(2) << "Edge locations in degrees: "
-                  << S2LatLng(vertex(i)) << "-" << S2LatLng(vertex(i+1))
-                  << " and "
-                  << S2LatLng(vertex(ai)) << "-" << S2LatLng(vertex(ai+1));
+          // additional debugging information, reverse Lat/Lng order.
+          string errDetail = s2_env::StringStream()
+             << "Edge locations in degrees: "
+             << S2LatLng(vertex(i)) << "-" << S2LatLng(vertex(i + 1))
+             << " and "
+             << S2LatLng(vertex(ai)) << "-" << S2LatLng(vertex(ai + 1));
+          VLOG(2) << errDetail;
+          if (NULL != err) {
+            *err = s2_env::StringStream()
+               << "Edges " << i << " and " << ai << " cross. " << errDetail;
+          }
           break;
         }
       }
@@ -241,7 +265,9 @@ S2Loop::S2Loop(S2Loop const* src)
     depth_(src->depth_),
     index_(this),
     num_find_vertex_calls_(0) {
-  memcpy(vertices_, src->vertices_, num_vertices_ * sizeof(vertices_[0]));
+  // mongodb: void* casts to silence a -Wclass-memaccess warning.
+  memcpy(static_cast<void*>(vertices_), static_cast<const void*>(src->vertices_),
+         num_vertices_ * sizeof(vertices_[0]));
 }
 
 S2Loop* S2Loop::Clone() const {

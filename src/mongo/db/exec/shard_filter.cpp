@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,85 +27,106 @@
  *    it in the license file.
  */
 
-#include "mongo/db/exec/shard_filter.h"
 
-#include "mongo/db/keypattern.h"
+#include <memory>
+#include <utility>
+#include <vector>
+
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/shard_filter.h"
+#include "mongo/db/exec/shard_filterer.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
-    ShardFilterStage::ShardFilterStage(const string& ns, WorkingSet* ws, PlanStage* child)
-        : _ws(ws), _child(child), _ns(ns), _initted(false) { }
+using std::unique_ptr;
 
-    ShardFilterStage::~ShardFilterStage() { }
+// static
+const char* ShardFilterStage::kStageType = "SHARDING_FILTER";
 
-    bool ShardFilterStage::isEOF() { return _child->isEOF(); }
+ShardFilterStage::ShardFilterStage(ExpressionContext* expCtx,
+                                   ScopedCollectionFilter collectionFilter,
+                                   WorkingSet* ws,
+                                   std::unique_ptr<PlanStage> child)
+    : PlanStage(kStageType, expCtx), _ws(ws), _shardFilterer(std::move(collectionFilter)) {
+    _children.emplace_back(std::move(child));
+}
 
-    PlanStage::StageState ShardFilterStage::work(WorkingSetID* out) {
-        ++_commonStats.works;
-        if (!_initted) {
-            _metadata = shardingState.getCollectionMetadata(_ns);
-            _initted = true;
-        }
+ShardFilterStage::~ShardFilterStage() {}
 
-        // If we've returned as many results as we're limited to, isEOF will be true.
-        if (isEOF()) { return PlanStage::IS_EOF; }
+bool ShardFilterStage::isEOF() const {
+    return child()->isEOF();
+}
 
-        StageState status = _child->work(out);
+PlanStage::StageState ShardFilterStage::doWork(WorkingSetID* out) {
+    // If we've returned as many results as we're limited to, isEOF will be true.
+    if (isEOF()) {
+        return PlanStage::IS_EOF;
+    }
 
-        if (PlanStage::ADVANCED == status) {
-            // If we're sharded make sure that we don't return any data that hasn't been migrated
-            // off of our shared yet.
-            if (_metadata) {
-                // This information can change if we yield and as such we must make sure to re-fetch
-                // it if we yield.
-                KeyPattern kp(_metadata->getKeyPattern());
+    StageState status = child()->work(out);
 
-                WorkingSetMember* member = _ws->get(*out);
+    if (PlanStage::ADVANCED == status) {
+        // If we're sharded make sure that we don't return data that is not owned by us,
+        // including pending documents from in-progress migrations and orphaned documents from
+        // aborted migrations
+        if (_shardFilterer.isCollectionSharded()) {
+            WorkingSetMember* member = _ws->get(*out);
+            ShardFilterer::DocumentBelongsResult res = _shardFilterer.documentBelongsToMe(*member);
+            if (res != ShardFilterer::DocumentBelongsResult::kBelongs) {
+                if (res == ShardFilterer::DocumentBelongsResult::kNoShardKey) {
+                    // We can't find a shard key for this working set member - this should never
+                    // happen with a non-fetched result unless our query planning is screwed up
+                    invariant(member->hasObj());
 
-                // This performs excessive BSONObj creation but that's OK for now.
-                if (!_metadata->keyBelongsToMe(kp.extractSingleKey(member->obj))) {
-                    _ws->free(*out);
-                    ++_specificStats.chunkSkips;
-                    return PlanStage::NEED_TIME;
+                    // Skip this working set member with a warning - no shard key should not be
+                    // possible unless manually inserting data into a shard
+                    LOGV2_WARNING(
+                        23787,
+                        "No shard key found in document, it may have been inserted manually "
+                        "into shard",
+                        "document"_attr = redact(member->doc.value().toBson()),
+                        "keyPattern"_attr = _shardFilterer.getKeyPattern());
+                } else {
+                    invariant(res == ShardFilterer::DocumentBelongsResult::kDoesNotBelong);
                 }
-            }
 
-            // If we're here either we have shard state and our doc passed, or we have no shard
-            // state.  Either way, we advance.
-            return status;
+                // If the document had no shard key, or doesn't belong to us, skip it.
+                _ws->free(*out);
+                ++_specificStats.chunkSkips;
+                return PlanStage::NEED_TIME;
+            }
         }
-        else {
-            if (PlanStage::NEED_FETCH == status) {
-                ++_commonStats.needFetch;
-            }
-            else if (PlanStage::NEED_TIME == status) {
-                ++_commonStats.needTime;
-            }
-            return status;
-        }
+
+        // If we're here either we have shard state and our doc passed, or we have no shard
+        // state.  Either way, we advance.
+        return status;
     }
 
-    void ShardFilterStage::prepareToYield() {
-        ++_commonStats.yields;
-        _child->prepareToYield();
-    }
+    return status;
+}
 
-    void ShardFilterStage::recoverFromYield() {
-        ++_commonStats.unyields;
-        _child->recoverFromYield();
-    }
+unique_ptr<PlanStageStats> ShardFilterStage::getStats() {
+    _commonStats.isEOF = isEOF();
+    unique_ptr<PlanStageStats> ret =
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_SHARDING_FILTER);
+    ret->children.emplace_back(child()->getStats());
+    ret->specific = std::make_unique<ShardingFilterStats>(_specificStats);
+    return ret;
+}
 
-    void ShardFilterStage::invalidate(const DiskLoc& dl) {
-        ++_commonStats.invalidates;
-        _child->invalidate(dl);
-    }
-
-    PlanStageStats* ShardFilterStage::getStats() {
-        _commonStats.isEOF = isEOF();
-        auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_SHARDING_FILTER));
-        ret->children.push_back(_child->getStats());
-        ret->specific.reset(new ShardingFilterStats(_specificStats));
-        return ret.release();
-    }
+const SpecificStats* ShardFilterStage::getSpecificStats() const {
+    return &_specificStats;
+}
 
 }  // namespace mongo

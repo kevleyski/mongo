@@ -1,93 +1,67 @@
+/*
+ * Simple test to ensure that an invalid reconfig fails, a valid one succeeds, and a reconfig won't
+ * succeed without force if force is needed.
+ */
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {isConfigCommitted} from "jstests/replsets/rslib.js";
 
-// try reconfiguring with servers down
+// Skip db hash check because secondary is left with a different config.
+TestData.skipCheckDBHashes = true;
 
-var replTest = new ReplSetTest({ name: 'testSet', nodes: 5 });
+var numNodes = 5;
+var replTest = new ReplSetTest({name: 'testSet', nodes: numNodes});
 var nodes = replTest.startSet();
 replTest.initiate();
 
-var master = replTest.getMaster();
+var primary = replTest.getPrimary();
 
-print("initial sync");
-master.getDB("foo").bar.insert({X:1});
+replTest.awaitSecondaryNodes();
+
+jsTestLog("Valid reconfig");
+var config = primary.getDB("local").system.replset.findOne();
+printjson(config);
+config.version++;
+config.members[nodes.indexOf(primary)].priority = 2;
+assert.commandWorked(primary.getDB("admin").runCommand({replSetReconfig: config}));
+// Successful reconfig writes a no-op into the oplog.
+const expectedNoOp = {
+    op: "n",
+    o: {msg: "Reconfig set", version: config.version}
+};
+const primaryOplog = primary.getDB("local")['oplog.rs'];
+const lastOp = primaryOplog.find(expectedNoOp).sort({'$natural': -1}).limit(1).toArray();
+assert(lastOp.length > 0);
 replTest.awaitReplication();
 
-print("invalid reconfig");
-var config = master.getDB("local").system.replset.findOne();
+// Make sure that all nodes have installed the config before moving on.
+replTest.waitForConfigReplication(primary, nodes);
+assert.soonNoExcept(() => isConfigCommitted(primary));
+
+jsTestLog("Invalid reconfig");
 config.version++;
-config.members.push({_id : 5, host : "localhost:12345, votes:0"});
-var result = master.adminCommand({replSetReconfig : config});
-printjson(result);
-assert.eq(result.ok, 0);
+var badMember = {_id: numNodes, host: "localhost:12345", priority: "High"};
+config.members.push(badMember);
+var invalidConfigCode = 93;
+assert.commandFailedWithCode(primary.adminCommand({replSetReconfig: config}), invalidConfigCode);
 
-print("stopping 3 & 4");
-replTest.stop(3);
-replTest.stop(4);
+jsTestLog("No force when needed.");
+config.members = config.members.slice(0, numNodes - 1);
+var secondary = replTest.getSecondary();
+config.members[nodes.indexOf(secondary)].priority = 5;
+var admin = secondary.getDB("admin");
+var forceRequiredCode = 10107;
+assert.commandFailedWithCode(admin.runCommand({replSetReconfig: config}), forceRequiredCode);
 
-print("reconfiguring");
-master = replTest.getMaster();
-config = master.getDB("local").system.replset.findOne();
-var oldVersion = config.version++;
-config.members[0].votes = 2;
-config.members[3].votes = 2;
-try {
-    master.getDB("admin").runCommand({replSetReconfig : config});
-}
-catch(e) {
-    print(e);
-}
+jsTestLog("Force when appropriate");
+assert.commandWorked(admin.runCommand({replSetReconfig: config, force: true}));
 
-assert.soon(function() {
-    try {
-        var config = master.getDB("local").system.replset.findOne();
-        return oldVersion+1 == config.version;
-    }
-    catch (e) {
-        print("Query failed: "+e);
-        return false;
-    }
+// Wait for the last node to know it is REMOVED before stopping the test.
+jsTestLog("Waiting for the last node to be REMOVED.");
+assert.soonNoExcept(() => {
+    assert.commandFailedWithCode(nodes[4].adminCommand({'replSetGetStatus': 1}),
+                                 ErrorCodes.InvalidReplicaSetConfig);
+    return true;
 });
-
-
-print("0 & 3 up; 1, 2, 4 down");
-replTest.restart(3);
-
-// in case 0 isn't master
-replTest.awaitReplication();
-
-replTest.stop(1);
-replTest.stop(2);
-
-print("try to reconfigure with a 'majority' down");
-oldVersion = config.version;
-config.version++;
-master = replTest.getMaster();
-try {
-    master.getDB("admin").runCommand({replSetReconfig : config});
-}
-catch (e) {
-    print(e);
-}
-
-var config = master.getDB("local").system.replset.findOne();
-assert.eq(oldVersion+1, config.version);
+jsTestLog("Finished waiting for the last node to be REMOVED.");
 
 replTest.stopSet();
-
-replTest2 = new ReplSetTest({name : 'testSet2', nodes : 1});
-nodes = replTest2.startSet();
-
-assert.soon(function() {
-    try {
-        result = nodes[0].getDB("admin").runCommand({replSetInitiate : {_id : "testSet2", members : [
-            {_id : 0, tags : ["member0"]}
-        ]}});
-        printjson(result);
-        return result.errmsg.match(/bad or missing host field/);
-    }
-    catch (e) {
-        print(e);
-    }
-    return false;
-});
-
-replTest2.stopSet();

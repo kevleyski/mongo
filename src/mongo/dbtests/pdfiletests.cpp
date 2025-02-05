@@ -1,396 +1,197 @@
-// pdfiletests.cpp : pdfile unit tests.
-//
-
 /**
- *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#include "mongo/pch.h"
+#include <memory>
+#include <string>
+#include <vector>
 
-#include "mongo/db/db.h"
-#include "mongo/db/json.h"
-#include "mongo/db/pdfile.h"
-#include "mongo/dbtests/dbtests.h"
+#include <boost/move/utility_core.hpp>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/database.h"
+#include "mongo/db/client.h"
+#include "mongo/db/collection_crud/collection_write_path.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/write_ops/insert.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+
+namespace mongo {
 namespace PdfileTests {
+namespace Insert {
 
-    // XXX: These tests have been ported to query_stage_collscan.cpp and are deprecated here.
-    namespace ScanCapped {
+class Base {
+public:
+    Base() : _lk(&_opCtx), _context(&_opCtx, nss()) {}
 
-        class Base {
-        public:
-            Base() : _context( ns() ) {
-            }
-            virtual ~Base() {
-                if ( !nsd() )
-                    return;
-                _context.db()->dropCollection( ns() );
-            }
-            void run() {
-                stringstream spec;
-                spec << "{\"capped\":true,\"size\":2000,\"$nExtents\":" << nExtents() << "}";
-                string err;
-                ASSERT( userCreateNS( ns(), fromjson( spec.str() ), err, false ) );
-                prepare();
-                int j = 0;
-                for ( boost::shared_ptr<Cursor> i = theDataFileMgr.findAll( ns() );
-                        i->ok(); i->advance(), ++j )
-                    ASSERT_EQUALS( j, i->current().firstElement().number() );
-                ASSERT_EQUALS( count(), j );
+    virtual ~Base() {
+        if (!collection())
+            return;
+        WriteUnitOfWork wunit(&_opCtx);
+        _context.db()->dropCollection(&_opCtx, nss()).transitional_ignore();
+        wunit.commit();
+    }
 
-                j = count() - 1;
-                for ( boost::shared_ptr<Cursor> i =
-                            findTableScan( ns(), fromjson( "{\"$natural\":-1}" ) );
-                        i->ok(); i->advance(), --j )
-                    ASSERT_EQUALS( j, i->current().firstElement().number() );
-                ASSERT_EQUALS( -1, j );
-            }
-        protected:
-            virtual void prepare() = 0;
-            virtual int count() const = 0;
-            virtual int nExtents() const {
-                return 0;
-            }
-            // bypass standard alloc/insert routines to use the extent we want.
-            static DiskLoc insert( const DiskLoc& ext, int i ) {
-                BSONObjBuilder b;
-                b.append( "a", i );
-                BSONObj o = b.done();
-                int len = o.objsize();
-                Extent *e = ext.ext();
-                e = getDur().writing(e);
-                int ofs;
-                if ( e->lastRecord.isNull() )
-                    ofs = ext.getOfs() + ( e->_extentData - (char *)e );
-                else
-                    ofs = e->lastRecord.getOfs() + e->lastRecord.rec()->lengthWithHeaders();
-                DiskLoc dl( ext.a(), ofs );
-                Record *r = dl.rec();
-                r = (Record*) getDur().writingPtr(r, Record::HeaderSize + len);
-                r->lengthWithHeaders() = Record::HeaderSize + len;
-                r->extentOfs() = e->myLoc.getOfs();
-                r->nextOfs() = DiskLoc::NullOfs;
-                r->prevOfs() = e->lastRecord.isNull() ? DiskLoc::NullOfs : e->lastRecord.getOfs();
-                memcpy( r->data(), o.objdata(), len );
-                if ( e->firstRecord.isNull() )
-                    e->firstRecord = dl;
-                else
-                    getDur().writingInt(e->lastRecord.rec()->nextOfs()) = ofs;
-                e->lastRecord = dl;
-                return dl;
-            }
-            static const char *ns() {
-                return "unittests.ScanCapped";
-            }
-            static NamespaceDetails *nsd() {
-                return nsdetails( ns() );
-            }
-        private:
-            Lock::GlobalWrite lk_;
-            Client::Context _context;
-        };
+protected:
+    static NamespaceString nss() {
+        return NamespaceString::createNamespaceString_forTest("unittests.pdfiletests.Insert");
+    }
+    CollectionPtr collection() {
+        return CollectionPtr(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
+    }
 
-        class Empty : public Base {
-            virtual void prepare() {}
-            virtual int count() const {
-                return 0;
-            }
-        };
+    const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
+    OperationContext& _opCtx = *_opCtxPtr;
+    Lock::GlobalWrite _lk;
+    OldClientContext _context;
+};
 
-        class EmptyLooped : public Base {
-            virtual void prepare() {
-                nsd()->writingWithExtra()->capFirstNewRecord() = DiskLoc();
-            }
-            virtual int count() const {
-                return 0;
-            }
-        };
-
-        class EmptyMultiExtentLooped : public Base {
-            virtual void prepare() {
-                nsd()->writingWithExtra()->capFirstNewRecord() = DiskLoc();
-            }
-            virtual int count() const {
-                return 0;
-            }
-            virtual int nExtents() const {
-                return 3;
-            }
-        };
-
-        class Single : public Base {
-            virtual void prepare() {
-                nsd()->writingWithExtra()->capFirstNewRecord() = insert( nsd()->capExtent(), 0 );
-            }
-            virtual int count() const {
-                return 1;
-            }
-        };
-
-        class NewCapFirst : public Base {
-            virtual void prepare() {
-                DiskLoc x = insert( nsd()->capExtent(), 0 );
-                nsd()->writingWithExtra()->capFirstNewRecord() = x;
-                insert( nsd()->capExtent(), 1 );
-            }
-            virtual int count() const {
-                return 2;
-            }
-        };
-
-        class NewCapLast : public Base {
-            virtual void prepare() {
-                insert( nsd()->capExtent(), 0 );
-                nsd()->capFirstNewRecord().writing() = insert( nsd()->capExtent(), 1 );
-            }
-            virtual int count() const {
-                return 2;
-            }
-        };
-
-        class NewCapMiddle : public Base {
-            virtual void prepare() {
-                insert( nsd()->capExtent(), 0 );
-                nsd()->capFirstNewRecord().writing() = insert( nsd()->capExtent(), 1 );
-                insert( nsd()->capExtent(), 2 );
-            }
-            virtual int count() const {
-                return 3;
-            }
-        };
-
-        class FirstExtent : public Base {
-            virtual void prepare() {
-                insert( nsd()->capExtent(), 0 );
-                insert( nsd()->lastExtent(), 1 );
-                nsd()->capFirstNewRecord().writing() = insert( nsd()->capExtent(), 2 );
-                insert( nsd()->capExtent(), 3 );
-            }
-            virtual int count() const {
-                return 4;
-            }
-            virtual int nExtents() const {
-                return 2;
-            }
-        };
-
-        class LastExtent : public Base {
-            virtual void prepare() {
-                nsd()->capExtent().writing() = nsd()->lastExtent();
-                insert( nsd()->capExtent(), 0 );
-                insert( nsd()->firstExtent(), 1 );
-                nsd()->capFirstNewRecord().writing() = insert( nsd()->capExtent(), 2 );
-                insert( nsd()->capExtent(), 3 );
-            }
-            virtual int count() const {
-                return 4;
-            }
-            virtual int nExtents() const {
-                return 2;
-            }
-        };
-
-        class MidExtent : public Base {
-            virtual void prepare() {
-                nsd()->capExtent().writing() = nsd()->firstExtent().ext()->xnext;
-                insert( nsd()->capExtent(), 0 );
-                insert( nsd()->lastExtent(), 1 );
-                insert( nsd()->firstExtent(), 2 );
-                nsd()->capFirstNewRecord().writing() = insert( nsd()->capExtent(), 3 );
-                insert( nsd()->capExtent(), 4 );
-            }
-            virtual int count() const {
-                return 5;
-            }
-            virtual int nExtents() const {
-                return 3;
-            }
-        };
-
-        class AloneInExtent : public Base {
-            virtual void prepare() {
-                nsd()->capExtent().writing() = nsd()->firstExtent().ext()->xnext;
-                insert( nsd()->lastExtent(), 0 );
-                insert( nsd()->firstExtent(), 1 );
-                nsd()->capFirstNewRecord().writing() = insert( nsd()->capExtent(), 2 );
-            }
-            virtual int count() const {
-                return 3;
-            }
-            virtual int nExtents() const {
-                return 3;
-            }
-        };
-
-        class FirstInExtent : public Base {
-            virtual void prepare() {
-                nsd()->capExtent().writing() = nsd()->firstExtent().ext()->xnext;
-                insert( nsd()->lastExtent(), 0 );
-                insert( nsd()->firstExtent(), 1 );
-                nsd()->capFirstNewRecord().writing() = insert( nsd()->capExtent(), 2 );
-                insert( nsd()->capExtent(), 3 );
-            }
-            virtual int count() const {
-                return 4;
-            }
-            virtual int nExtents() const {
-                return 3;
-            }
-        };
-
-        class LastInExtent : public Base {
-            virtual void prepare() {
-                nsd()->capExtent().writing() = nsd()->firstExtent().ext()->xnext;
-                insert( nsd()->capExtent(), 0 );
-                insert( nsd()->lastExtent(), 1 );
-                insert( nsd()->firstExtent(), 2 );
-                nsd()->capFirstNewRecord().writing() = insert( nsd()->capExtent(), 3 );
-            }
-            virtual int count() const {
-                return 4;
-            }
-            virtual int nExtents() const {
-                return 3;
-            }
-        };
-
-    } // namespace ScanCapped
-
-    namespace Insert {
-        class Base {
-        public:
-            Base() : _context( ns() ) {
-            }
-            virtual ~Base() {
-                if ( !nsd() )
-                    return;
-                _context.db()->dropCollection( ns() );
-            }
-        protected:
-            static const char *ns() {
-                return "unittests.pdfiletests.Insert";
-            }
-            static NamespaceDetails *nsd() {
-                return nsdetails( ns() );
-            }
-        private:
-            Lock::GlobalWrite lk_;
-            Client::Context _context;
-        };
-
-        class InsertAddId : public Base {
-        public:
-            void run() {
-                BSONObj x = BSON( "x" << 1 );
-                ASSERT( x["_id"].type() == 0 );
-                theDataFileMgr.insertWithObjMod( ns(), x );
-                ASSERT( x["_id"].type() == jstOID );
-            }
-        };
-
-        class UpdateDate : public Base {
-        public:
-            void run() {
-                BSONObjBuilder b;
-                b.appendTimestamp( "a" );
-                BSONObj o = b.done();
-                ASSERT( 0 == o.getField( "a" ).date() );
-                theDataFileMgr.insertWithObjMod( ns(), o );
-                ASSERT( 0 != o.getField( "a" ).date() );
-            }
-        };
-    } // namespace Insert
-
-    class ExtentSizing {
-    public:
-        struct SmallFilesControl {
-            SmallFilesControl() {
-                old = storageGlobalParams.smallfiles;
-                storageGlobalParams.smallfiles = false;
-            }
-            ~SmallFilesControl() {
-                storageGlobalParams.smallfiles = old;
-            }
-            bool old;
-        };
-        void run() {
-            SmallFilesControl c;
-
-            ASSERT_EQUALS( Extent::maxSize(),
-                           ExtentManager::quantizeExtentSize( Extent::maxSize() ) );
-
-            // test that no matter what we start with, we always get to max extent size
-            for ( int obj=16; obj<BSONObjMaxUserSize; obj += 111 ) {
-
-                int sz = Extent::initialSize( obj );
-
-                double totalExtentSize = sz;
-
-                int numFiles = 1;
-                int sizeLeftInExtent = Extent::maxSize() - 1;
-
-                for ( int i=0; i<100; i++ ) {
-                    sz = Extent::followupSize( obj , sz );
-                    ASSERT( sz >= obj );
-                    ASSERT( sz >= Extent::minSize() );
-                    ASSERT( sz <= Extent::maxSize() );
-                    ASSERT( sz <= DataFile::maxSize() );
-
-                    totalExtentSize += sz;
-
-                    if ( sz < sizeLeftInExtent ) {
-                        sizeLeftInExtent -= sz;
-                    }
-                    else {
-                        numFiles++;
-                        sizeLeftInExtent = Extent::maxSize() - sz;
-                    }
-                }
-                ASSERT_EQUALS( Extent::maxSize() , sz );
-
-                double allocatedOnDisk = (double)numFiles * Extent::maxSize();
-
-                ASSERT( ( totalExtentSize / allocatedOnDisk ) > .95 );
-
-            }
+class InsertNoId : public Base {
+public:
+    void run() {
+        WriteUnitOfWork wunit(&_opCtx);
+        BSONObj x = BSON("x" << 1);
+        ASSERT(x["_id"].type() == 0);
+        CollectionPtr coll(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
+        if (!coll) {
+            coll = CollectionPtr(_context.db()->createCollection(&_opCtx, nss()));
         }
-    };
+        ASSERT(coll);
+        OpDebug* const nullOpDebug = nullptr;
+        ASSERT_NOT_OK(collection_internal::insertDocument(
+            &_opCtx, coll, InsertStatement(x), nullOpDebug, true));
 
-    class All : public Suite {
-    public:
-        All() : Suite( "pdfile" ) {}
+        StatusWith<BSONObj> fixed = fixDocumentForInsert(&_opCtx, x);
+        ASSERT(fixed.isOK());
+        x = fixed.getValue();
+        ASSERT(x["_id"].type() == jstOID);
+        ASSERT_OK(collection_internal::insertDocument(
+            &_opCtx, coll, InsertStatement(x), nullOpDebug, true));
+        wunit.commit();
+    }
+};
 
-        void setupTests() {
-            add< ScanCapped::Empty >();
-            add< ScanCapped::EmptyLooped >();
-            add< ScanCapped::EmptyMultiExtentLooped >();
-            add< ScanCapped::Single >();
-            add< ScanCapped::NewCapFirst >();
-            add< ScanCapped::NewCapLast >();
-            add< ScanCapped::NewCapMiddle >();
-            add< ScanCapped::FirstExtent >();
-            add< ScanCapped::LastExtent >();
-            add< ScanCapped::MidExtent >();
-            add< ScanCapped::AloneInExtent >();
-            add< ScanCapped::FirstInExtent >();
-            add< ScanCapped::LastInExtent >();
-            add< Insert::InsertAddId >();
-            add< Insert::UpdateDate >();
-            add< ExtentSizing >();
+class UpdateDate : public Base {
+public:
+    void run() {
+        BSONObjBuilder b;
+        b.appendTimestamp("a");
+        b.append("_id", 1);
+        BSONObj o = b.done();
+
+        BSONObj fixed = fixDocumentForInsert(&_opCtx, o).getValue();
+        ASSERT_EQUALS(2, fixed.nFields());
+        ASSERT(fixed.firstElement().fieldNameStringData() == "_id");
+        ASSERT(fixed.firstElement().number() == 1);
+
+        BSONElement a = fixed["a"];
+        ASSERT(o["a"].type() == bsonTimestamp);
+        ASSERT(o["a"].timestampValue() == 0);
+        ASSERT(a.type() == bsonTimestamp);
+        ASSERT(a.timestampValue() > 0);
+    }
+};
+
+class UpdateDate2 : public Base {
+public:
+    void run() {
+        BSONObj o;
+        {
+            BSONObjBuilder b;
+            b.appendTimestamp("a");
+            b.appendTimestamp("b");
+            b.append("_id", 1);
+            o = b.obj();
         }
-    } myall;
 
-} // namespace PdfileTests
+        BSONObj fixed = fixDocumentForInsert(&_opCtx, o).getValue();
+        ASSERT_EQUALS(3, fixed.nFields());
+        ASSERT(fixed.firstElement().fieldNameStringData() == "_id");
+        ASSERT(fixed.firstElement().number() == 1);
 
+        BSONElement a = fixed["a"];
+        ASSERT(o["a"].type() == bsonTimestamp);
+        ASSERT(o["a"].timestampValue() == 0);
+        ASSERT(a.type() == bsonTimestamp);
+        ASSERT(a.timestampValue() > 0);
+
+        BSONElement b = fixed["b"];
+        ASSERT(o["b"].type() == bsonTimestamp);
+        ASSERT(o["b"].timestampValue() == 0);
+        ASSERT(b.type() == bsonTimestamp);
+        ASSERT(b.timestampValue() > 0);
+    }
+};
+
+class ValidId : public Base {
+public:
+    void run() {
+        ASSERT(fixDocumentForInsert(&_opCtx, BSON("_id" << 5)).isOK());
+        ASSERT(fixDocumentForInsert(&_opCtx, BSON("_id" << BSON("x" << 5))).isOK());
+        ASSERT(!fixDocumentForInsert(&_opCtx, BSON("_id" << BSON("$x" << 5))).isOK());
+        ASSERT(!fixDocumentForInsert(&_opCtx, BSON("_id" << BSON("$oid" << 5))).isOK());
+    }
+};
+}  // namespace Insert
+
+class All : public unittest::OldStyleSuiteSpecification {
+public:
+    All() : OldStyleSuiteSpecification("pdfile") {}
+
+    void setupTests() override {
+        add<Insert::InsertNoId>();
+        add<Insert::UpdateDate>();
+        add<Insert::UpdateDate2>();
+        add<Insert::ValidId>();
+    }
+};
+
+unittest::OldStyleSuiteInitializer<All> myall;
+
+}  // namespace PdfileTests
+}  // namespace mongo

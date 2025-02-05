@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,53 +29,126 @@
 
 #pragma once
 
-#include "mongo/db/diskloc.h"
+#include <boost/optional/optional.hpp>
+#include <memory>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/admission/execution_admission_context.h"
 #include "mongo/db/exec/collection_scan_common.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/requires_collection_stage.h"
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/matcher/expression.h"
-#include "mongo/db/structure/collection_iterator.h"
+#include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/s/resharding/resume_token_gen.h"
 
 namespace mongo {
 
-    class WorkingSet;
+struct Record;
+class SeekableRecordCursor;
+class WorkingSet;
+class OperationContext;
+
+/**
+ * Scans over a collection, starting at the RecordId provided in params and continuing until
+ * there are no more records in the collection.
+ *
+ * Preconditions: Valid RecordId.
+ */
+class CollectionScan final : public RequiresCollectionStage {
+public:
+    CollectionScan(ExpressionContext* expCtx,
+                   VariantCollectionPtrOrAcquisition collection,
+                   const CollectionScanParams& params,
+                   WorkingSet* workingSet,
+                   const MatchExpression* filter);
+
+    StageState doWork(WorkingSetID* out) final;
+    bool isEOF() const final;
+
+    void doDetachFromOperationContext() final;
+    void doReattachToOperationContext() final;
+
+    StageType stageType() const final {
+        return STAGE_COLLSCAN;
+    }
+
+    Timestamp getLatestOplogTimestamp() const {
+        return _latestOplogEntryTimestamp;
+    }
+
+    BSONObj getPostBatchResumeToken() const;
+
+    std::unique_ptr<PlanStageStats> getStats() final;
+
+    const SpecificStats* getSpecificStats() const final;
+
+    CollectionScanParams::Direction getDirection() const {
+        return _params.direction;
+    }
+
+protected:
+    void doSaveStateRequiresCollection() final;
+
+    void doRestoreStateRequiresCollection() final;
+
+private:
+    /**
+     * If the member (with id memberID) passes our filter, set *out to memberID and return that
+     * ADVANCED.  Otherwise, free memberID and return NEED_TIME.
+     */
+    StageState returnIfMatches(WorkingSetMember* member, WorkingSetID memberID, WorkingSetID* out);
 
     /**
-     * Scans over a collection, starting at the DiskLoc provided in params and continuing until
-     * there are no more records in the collection.
-     *
-     * Preconditions: Valid DiskLoc.
+     * Sets '_latestOplogEntryTimestamp' to the current read timestamp, if available. This is
+     * equivalent to the latest visible timestamp in the oplog.
      */
-    class CollectionScan : public PlanStage {
-    public:
-        CollectionScan(const CollectionScanParams& params, WorkingSet* workingSet,
-                       const MatchExpression* filter);
+    void setLatestOplogEntryTimestampToReadTimestamp();
 
-        virtual StageState work(WorkingSetID* out);
-        virtual bool isEOF();
+    /**
+     * Extracts the timestamp from the 'ts' field of 'record', and sets '_latestOplogEntryTimestamp'
+     * to that time if it isn't already greater. Throws an exception if the 'ts' field cannot be
+     * extracted.
+     */
+    void setLatestOplogEntryTimestamp(const Record& record);
 
-        virtual void invalidate(const DiskLoc& dl);
-        virtual void prepareToYield();
-        virtual void recoverFromYield();
+    /**
+     * Set up the cursor.
+     */
+    void initCursor(OperationContext* opCtx, const CollectionPtr& collPtr, bool forward);
 
-        virtual PlanStageStats* getStats();
+    // WorkingSet is not owned by us.
+    WorkingSet* _workingSet;
 
-    private:
-        // WorkingSet is not owned by us.
-        WorkingSet* _workingSet;
+    // The filter is not owned by us.
+    const MatchExpression* _filter;
 
-        // The filter is not owned by us.
-        const MatchExpression* _filter;
+    std::unique_ptr<SeekableRecordCursor> _cursor;
 
-        scoped_ptr<CollectionIterator> _iter;
+    CollectionScanParams _params;
 
-        CollectionScanParams _params;
+    RecordId _lastSeenId;  // Null if nothing has been returned from _cursor yet.
 
-        // True if nsdetails(_ns) == NULL on our first call to work.
-        bool _nsDropped;
+    // If _params.shouldTrackLatestOplogTimestamp is set and the collection is the oplog or a change
+    // collection, this is the latest timestamp seen by the collection scan. For change collections,
+    // on EOF we advance this timestamp to the latest timestamp in the global oplog.
+    Timestamp _latestOplogEntryTimestamp;
 
-        // Stats
-        CommonStats _commonStats;
-        CollectionScanStats _specificStats;
-    };
+    boost::optional<ScopedAdmissionPriority<ExecutionAdmissionContext>> _priority;
+
+    // Stats
+    CollectionScanStats _specificStats;
+
+    bool _useSeek = false;
+};
 
 }  // namespace mongo

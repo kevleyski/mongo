@@ -2,12 +2,17 @@
 
 Import("env")
 
-env.StaticLibrary(
-        target='key_generator',
-        source=[
-            'btree_key_generator.cpp',
-        ],
-        LIBDEPS=[
-            '$BUILD_DIR/mongo/bson',
-        ],
+env = env.Clone()
+
+env.Benchmark(
+    target="key_gen_bm",
+    source=[],
+    LIBDEPS=[],
+    BAZEL_BENCHMARK_TAG="second_half_bm",
+)
+
+env.CppUnitTest(
+    target="db_index_test",
+    source=[],
+    LIBDEPS=[],
 )

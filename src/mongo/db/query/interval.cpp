@@ -1,172 +1,244 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/query/interval.h"
 
+#include <utility>
+
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/debug_util.h"
+
 namespace mongo {
 
-    namespace {
+using std::string;
 
-        /** Returns true if lhs and rhs intersection is not empty */
-        bool intersects(const Interval& lhs, const Interval& rhs) {
-            int res = lhs.start.woCompare(rhs.end, false);
-            if (res > 0) {
-                return false;
-            }
-            else if (res == 0 && (!lhs.startInclusive || !rhs.endInclusive)) {
-                return false;
-            }
+Interval::Interval()
+    : _intervalData(BSONObj()),
+      start(BSONElement()),
+      startInclusive(false),
+      end(BSONElement()),
+      endInclusive(false) {}
 
-            res = rhs.start.woCompare(lhs.end, false);
-            if (res > 0) {
-                return false;
-            }
-            else if (res == 0 && (!rhs.startInclusive || !lhs.endInclusive)) {
-                return false;
-            }
+Interval::Interval(BSONObj base, bool si, bool ei) {
+    init(base, si, ei);
+}
 
-            return true;
-        }
+void Interval::init(BSONObj base, bool si, bool ei) {
+    MONGO_verify(base.nFields() >= 2);
 
-        /** Returns true if lhs and rhs represent the same interval */
-        bool exact(const Interval& lhs, const Interval& rhs) {
-            if (lhs.startInclusive != rhs.startInclusive) {
-                return false;
-            }
+    _intervalData = base.getOwned();
+    BSONObjIterator it(_intervalData);
+    start = it.next();
+    end = it.next();
+    startInclusive = si;
+    endInclusive = ei;
+}
 
-            if (lhs.endInclusive != rhs.endInclusive) {
-                return false;
-            }
+Interval::Interval(
+    BSONObj base, BSONElement start, bool startInclusive, BSONElement end, bool endInclusive)
+    : _intervalData(base),
+      start(start),
+      startInclusive(startInclusive),
+      end(end),
+      endInclusive(endInclusive) {}
 
-            int res = lhs.start.woCompare(rhs.start, false);
-            if (res != 0) {
-                return false;
-            }
+bool Interval::isEmpty() const {
+    return start.eoo() && end.eoo();
+}
 
-            res = lhs.end.woCompare(rhs.end, false);
-            if (res != 0) {
-                return false;
-            }
+bool Interval::isPoint() const {
+    return startInclusive && endInclusive && 0 == start.woCompare(end, false);
+}
 
-            return true;
-        }
+bool Interval::isNull() const {
+    return (!startInclusive || !endInclusive) && 0 == start.woCompare(end, false);
+}
 
-        /** Returns true if lhs is fully withing rhs */
-        bool within(const Interval& lhs, const Interval& rhs) {
-            int res = lhs.start.woCompare(rhs.start, false);
-            if (res < 0) {
-                return false;
-            }
-            else if (res == 0 && lhs.startInclusive && !rhs.startInclusive) {
-                return false;
-            }
-
-            res = lhs.end.woCompare(rhs.end, false);
-            if (res > 0) {
-                return false;
-            }
-            else if (res == 0 && lhs.endInclusive && !rhs.endInclusive) {
-                return false;
-            }
-
-            return true;
-        }
-
-        /** Returns true if the start of lhs comes before the start of rhs */
-        bool precedes(const Interval& lhs, const Interval& rhs) {
-            int res = lhs.start.woCompare(rhs.start, false);
-            if (res < 0) {
-                return true;
-            }
-            else if (res == 0 && lhs.startInclusive && !rhs.startInclusive) {
-                return true;
-            }
-            return false;
-        }
-
-    } // unnamed namespace
-
-    Interval::Interval()
-        : _intervalData(BSONObj()), start(BSONElement()), startInclusive(false), end(BSONElement()),
-          endInclusive(false) { }
-
-    Interval::Interval(BSONObj base, bool si, bool ei) {
-        init(base, si, ei);
+Interval::Direction Interval::getDirection() const {
+    if (isEmpty() || isPoint() || isNull()) {
+        return Direction::kDirectionNone;
     }
 
-    void Interval::init(BSONObj base, bool si, bool ei) {
-        dassert(base.nFields() >= 2);
+    // 'false' to not consider the field name.
+    const int res = start.woCompare(end, false);
 
-        _intervalData = base.getOwned();
-        BSONObjIterator it(_intervalData);
-        start = it.next();
-        end = it.next();
-        startInclusive = si;
-        endInclusive = ei;
+    invariant(res != 0);
+    return res < 0 ? Direction::kDirectionAscending : Direction::kDirectionDescending;
+}
+
+
+//
+// Comparison
+//
+
+bool Interval::equals(const Interval& other) const {
+    if (this->startInclusive != other.startInclusive) {
+        return false;
     }
 
-    bool Interval::isEmpty() const {
-        return _intervalData.nFields() == 0;
+    if (this->endInclusive != other.endInclusive) {
+        return false;
     }
 
-    // TODO: shortcut number of comparisons
-    Interval::IntervalComparison Interval::compare(const Interval& other) const {
-        //
-        // Intersect cases
-        //
-
-        // TODO: rewrite this to be member functions so semantics are clearer.
-        if (intersects(*this, other)) {
-            if (exact(*this, other)) {
-                return INTERVAL_EQUALS;
-            }
-            if (within(*this, other)) {
-                return INTERVAL_WITHIN;
-            }
-            if (within(other, *this)) {
-                return INTERVAL_CONTAINS;
-            }
-            if (precedes(*this, other)) {
-                return INTERVAL_OVERLAPS_BEFORE;
-            }
-            return INTERVAL_OVERLAPS_AFTER;
-        }
-
-        //
-        // Non-intersect cases
-        //
-
-        if (precedes(*this, other)) {
-            if (0 == end.woCompare(other.start, false)) {
-                return INTERVAL_PRECEDES_COULD_UNION;
-            }
-            return INTERVAL_PRECEDES;
-        }
-
-        return INTERVAL_SUCCEEDS;
+    int res = this->start.woCompare(other.start, false);
+    if (res != 0) {
+        return false;
     }
 
-    void Interval::intersect(const Interval& other, IntervalComparison cmp) {
-        if (cmp == INTERVAL_UNKNOWN) {
-            cmp = this->compare(other);
+    res = this->end.woCompare(other.end, false);
+    if (res != 0) {
+        return false;
+    }
+
+    return true;
+}
+
+bool Interval::intersects(const Interval& other) const {
+    if (kDebugBuild) {
+        // This function assumes that both intervals are ascending (or are empty/point intervals).
+        // Determining this may be expensive, so we only do these checks when in a debug build.
+        const auto thisDir = getDirection();
+        invariant(thisDir == Direction::kDirectionAscending ||
+                  thisDir == Direction::kDirectionNone);
+        const auto otherDir = other.getDirection();
+        invariant(otherDir == Direction::kDirectionAscending ||
+                  otherDir == Direction::kDirectionNone);
+    }
+
+    int res = this->start.woCompare(other.end, false);
+    if (res > 0) {
+        return false;
+    } else if (res == 0 && (!this->startInclusive || !other.endInclusive)) {
+        return false;
+    }
+
+    res = other.start.woCompare(this->end, false);
+    if (res > 0) {
+        return false;
+    } else if (res == 0 && (!other.startInclusive || !this->endInclusive)) {
+        return false;
+    }
+
+    return true;
+}
+
+bool Interval::within(const Interval& other) const {
+    int res = this->start.woCompare(other.start, false);
+    if (res < 0) {
+        return false;
+    } else if (res == 0 && this->startInclusive && !other.startInclusive) {
+        return false;
+    }
+
+    res = this->end.woCompare(other.end, false);
+    if (res > 0) {
+        return false;
+    } else if (res == 0 && this->endInclusive && !other.endInclusive) {
+        return false;
+    }
+
+    return true;
+}
+
+/** Returns true if the start of comes before the start of other */
+bool Interval::precedes(const Interval& other) const {
+    int res = this->start.woCompare(other.start, false);
+    if (res < 0) {
+        return true;
+    } else if (res == 0 && this->startInclusive && !other.startInclusive) {
+        return true;
+    }
+    return false;
+}
+
+bool Interval::isMinToMax() const {
+    return (start.type() == BSONType::MinKey && end.type() == BSONType::MaxKey);
+}
+
+bool Interval::isMaxToMin() const {
+    return (start.type() == BSONType::MaxKey && end.type() == BSONType::MinKey);
+}
+
+bool Interval::isFullyOpen() const {
+    return isMinToMax() || isMaxToMin();
+}
+
+Interval::IntervalComparison Interval::compare(const Interval& other) const {
+    //
+    // Intersect cases
+    //
+
+    if (this->intersects(other)) {
+        if (this->equals(other)) {
+            return INTERVAL_EQUALS;
         }
+        if (this->within(other)) {
+            return INTERVAL_WITHIN;
+        }
+        if (other.within(*this)) {
+            return INTERVAL_CONTAINS;
+        }
+        if (this->precedes(other)) {
+            return INTERVAL_OVERLAPS_BEFORE;
+        }
+        return INTERVAL_OVERLAPS_AFTER;
+    }
 
-        BSONObjBuilder builder;
-        switch (cmp) {
+    //
+    // Non-intersect cases
+    //
 
+    if (this->precedes(other)) {
+        // It's not possible for both endInclusive and other.startInclusive to be true because
+        // the bounds would intersect. Refer to section on "Intersect cases" above.
+        if ((endInclusive || other.startInclusive) && 0 == end.woCompare(other.start, false)) {
+            return INTERVAL_PRECEDES_COULD_UNION;
+        }
+        return INTERVAL_PRECEDES;
+    }
+
+    return INTERVAL_SUCCEEDS;
+}
+
+//
+// Mutation: Union and Intersection
+//
+
+void Interval::intersect(const Interval& other, IntervalComparison cmp) {
+    if (cmp == INTERVAL_UNKNOWN) {
+        cmp = this->compare(other);
+    }
+
+    BSONObjBuilder builder;
+    switch (cmp) {
         case INTERVAL_EQUALS:
         case INTERVAL_WITHIN:
             break;
@@ -195,18 +267,17 @@ namespace mongo {
             break;
 
         default:
-            dassert(false);
-        }
+            MONGO_verify(false);
+    }
+}
+
+void Interval::combine(const Interval& other, IntervalComparison cmp) {
+    if (cmp == INTERVAL_UNKNOWN) {
+        cmp = this->compare(other);
     }
 
-    void Interval::combine(const Interval& other, IntervalComparison cmp) {
-        if (cmp == INTERVAL_UNKNOWN) {
-            cmp = this->compare(other);
-        }
-
-        BSONObjBuilder builder;
-        switch (cmp) {
-
+    BSONObjBuilder builder;
+    switch (cmp) {
         case INTERVAL_EQUALS:
         case INTERVAL_CONTAINS:
             break;
@@ -232,59 +303,24 @@ namespace mongo {
             break;
 
         default:
-            dassert(false);
-        }
+            MONGO_verify(false);
     }
+}
 
-    // static
-    string Interval::cmpstr(IntervalComparison c) {
-        if (c == INTERVAL_EQUALS) {
-            return "INTERVAL_EQUALS";
-        }
+void Interval::reverse() {
+    std::swap(start, end);
+    std::swap(startInclusive, endInclusive);
+}
 
-        // 'this' contains the other interval.
-        if (c == INTERVAL_CONTAINS) {
-            return "INTERVAL_CONTAINS";
-        }
+Interval Interval::reverseClone() const {
+    Interval reversed;
+    reversed.start = end;
+    reversed.end = start;
+    reversed.startInclusive = endInclusive;
+    reversed.endInclusive = startInclusive;
+    reversed._intervalData = _intervalData;
 
-        // 'this' is contained by the other interval.
-        if (c == INTERVAL_WITHIN) {
-            return "INTERVAL_WITHIN";
-        }
+    return reversed;
+}
 
-        // The two intervals intersect and 'this' is before the other interval.
-        if (c == INTERVAL_OVERLAPS_BEFORE) {
-            return "INTERVAL_OVERLAPS_BEFORE";
-        }
-
-        // The two intervals intersect and 'this is after the other interval.
-        if (c == INTERVAL_OVERLAPS_AFTER) {
-            return "INTERVAL_OVERLAPS_AFTER";
-        }
-
-        // There is no intersection.
-        if (c == INTERVAL_PRECEDES) {
-            return "INTERVAL_PRECEDES";
-        }
-
-        if (c == INTERVAL_PRECEDES_COULD_UNION) {
-            return "INTERVAL_PRECEDES_COULD_UNION";
-        }
-
-        if (c == INTERVAL_SUCCEEDS) {
-            return "INTERVAL_SUCCEEDS";
-        }
-
-        if (c == INTERVAL_UNKNOWN) {
-            return "INTERVAL_UNKNOWN";
-        }
-
-        return "NO IDEA DUDE";
-    }
-
-    void Interval::reverse() {
-        std::swap(start, end);
-        std::swap(startInclusive, endInclusive);
-    }
-
-} // namespace mongo
+}  // namespace mongo

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,261 +29,207 @@
 
 #pragma once
 
+#include "mongo/db/query/ce/sampling_estimator.h"
+#include <cstddef>
+#include <functional>
+#include <map>
+#include <memory>
+#include <vector>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/cost_based_ranker/estimates_storage.h"
 #include "mongo/db/query/index_entry.h"
+#include "mongo/db/query/multiple_collection_accessor.h"
+#include "mongo/db/query/plan_cache/classic_plan_cache.h"
+#include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_solution.h"
 
 namespace mongo {
+// The logging facility enforces the rule that logging should not be done in a header file. Since
+// template classes and functions below must be defined in the header file and since they use the
+// logging facility, we have to define the helper functions below to perform the actual logging
+// operation from template code.
+namespace log_detail {
+void logSubplannerIndexEntry(const IndexEntry& entry, size_t childIndex);
+void logCachedPlanFound(size_t numChildren, size_t childIndex);
+void logCachedPlanNotFound(size_t numChildren, size_t childIndex);
+void logNumberOfSolutions(size_t numSolutions);
+}  // namespace log_detail
 
-    struct QueryPlannerParams {
-        enum Options {
-            // You probably want to set this.
-            DEFAULT = 0,
+class Collection;
+class CollectionPtr;
 
-            // Set this if you don't want a table scan.
-            // See http://docs.mongodb.org/manual/reference/parameters/
-            NO_TABLE_SCAN = 1,
+/**
+ * QueryPlanner's job is to provide an entry point to the query planning and optimization
+ * process.
+ */
+class QueryPlanner {
+public:
+    /**
+     * Holds the result of subqueries planning for rooted $or queries.
+     */
+    struct SubqueriesPlanningResult {
+        /**
+         * A class used internally in order to keep track of the results of planning
+         * a particular $or branch.
+         */
+        struct BranchPlanningResult {
+            // A parsed version of one branch of the $or.
+            std::unique_ptr<CanonicalQuery> canonicalQuery;
 
-            // Set this if you want a collscan outputted even if there's an ixscan.
-            INCLUDE_COLLSCAN = 2,
+            // If there is cache data available, then we store it here rather than generating
+            // a set of alternate plans for the branch. The index tags from the cache data
+            // can be applied directly to the parent $or MatchExpression when generating the
+            // composite solution.
+            std::unique_ptr<SolutionCacheData> cachedData;
 
-            // Set this if you're running on a sharded cluster.  We'll add a "drop all docs that
-            // shouldn't be on this shard" stage before projection.
-            INCLUDE_SHARD_FILTER = 4,
+            // Query solutions resulting from planning the $or branch.
+            std::vector<std::unique_ptr<QuerySolution>> solutions;
         };
 
-        // See Options enum above.
-        size_t options;
+        // The copy of the query that we will annotate with tags and use to construct the composite
+        // solution. Must be a rooted $or query, or a contained $or that has been rewritten to a
+        // rooted $or.
+        std::unique_ptr<MatchExpression> orExpression;
 
-        // What indices are available for planning?
-        vector<IndexEntry> indices;
+        // Holds a list of the results from planning each branch.
+        std::vector<std::unique_ptr<BranchPlanningResult>> branches;
 
-        // What's our shard key?  If INCLUDE_SHARD_FILTER is set we will create a shard filtering
-        // stage.  If we know the shard key, we can perform covering analysis instead of always
-        // forcing a fetch.
-        BSONObj shardKey;
+        // We need this to extract cache-friendly index data from the index assignments.
+        std::map<IndexEntry::Identifier, size_t> indexMap;
     };
 
     /**
-     * QueryPlanner's job is to provide an entry point to the query planning and optimization
-     * process.
+     * Holds the result of plan enumeration from cost-based ranking.
      */
-    class QueryPlanner {
-    public:
-        /**
-         * Outputs a series of possible solutions for the provided 'query' into 'out'.  Uses the
-         * indices and other data in 'params' to plan with.
-         *
-         * Caller owns pointers in *out.
-         */
-        static void plan(const CanonicalQuery& query,
-                         const QueryPlannerParams& params,
-                         vector<QuerySolution*>* out);
-    private:
+    struct CostBasedRankerResult {
+        // Query solutions resulting from plan enumeration. This set contains the best plan as
+        // determined by the cost-based ranker and plans for which we were unable to estimate a
+        // cost, likely due to the lack of cardinality estimates. These plans are intended to be
+        // passed along to the multi-planner to pick the best one using runtime planning.
+        std::vector<std::unique_ptr<QuerySolution>> solutions;
 
-        //
-        // Index Selection methods.
-        //
+        // For explain purposes.
 
-        /**
-         * Return all the fields in the tree rooted at 'node' that we can use an index on
-         * in order to answer the query.
-         *
-         * The 'prefix' argument is a path prefix to be prepended to any fields mentioned in
-         * predicates encountered.  Some array operators specify a path prefix.
-         */
-        static void getFields(MatchExpression* node, string prefix, unordered_set<string>* out);
+        // Query solutions which the cost-based ranker rejects from consideration because their cost
+        // estimate is higher than another plan. Useful for the implementation of explain to expose
+        // why certain plans were not chosen.
+        std::vector<std::unique_ptr<QuerySolution>> rejectedPlans;
 
-        /**
-         * Find all indices prefixed by fields we have predicates over.  Only these indices are
-         * useful in answering the query.
-         */
-        static void findRelevantIndices(const unordered_set<string>& fields,
-                                        const vector<IndexEntry>& indices,
-                                        vector<IndexEntry>* out);
-
-        /**
-         * Return true if the index key pattern field 'elt' (which belongs to 'index') can be used
-         * to answer the predicate 'node'.
-         *
-         * For example, {field: "hashed"} can only be used with sets of equalities.
-         *              {field: "2d"} can only be used with some geo predicates.
-         *              {field: "2dsphere"} can only be used with some other geo predicates.
-         */
-        static bool compatible(const BSONElement& elt, const IndexEntry& index, MatchExpression* node);
-
-        /**
-         * Determine how useful all of our relevant 'indices' are to all predicates in the subtree
-         * rooted at 'node'.  Affixes a RelevantTag to all predicate nodes which can use an index.
-         *
-         * 'prefix' is a path prefix that should be prepended to any path (certain array operators
-         * imply a path prefix).
-         *
-         * For an index to be useful to a predicate, the index must be compatible (see above).
-         *
-         * If an index is prefixed by the predicate's path, it's always useful.
-         *
-         * If an index is compound but not prefixed by a predicate's path, it's only useful if
-         * there exists another predicate that 1. will use that index and 2. is related to the
-         * original predicate by having an AND as a parent.
-         */
-        static void rateIndices(MatchExpression* node, string prefix,
-                                const vector<IndexEntry>& indices);
-
-        //
-        // Collection Scan Data Access method.
-        //
-
-        /**
-         * Return a CollectionScanNode that scans as requested in 'query'.
-         */
-        static QuerySolution* makeCollectionScan(const CanonicalQuery& query,
-                                                 bool tailable,
-                                                 const QueryPlannerParams& params);
-
-        //
-        // Indexed Data Access methods.
-        //
-        // The inArrayOperator flag deserves some attention.  It is set when we're processing a child of
-        // a MatchExpression::ALL or MatchExpression::ELEM_MATCH_OBJECT.
-        //
-        // When true, the following behavior changes for all methods below that take it as an argument:
-        // 0. No deletion of MatchExpression(s).  In fact,
-        // 1. No mutation of the MatchExpression at all.  We need the tree as-is in order to perform
-        //    a filter on the entire tree.
-        // 2. No fetches performed.  There will be a final fetch by the caller of buildIndexedDataAccess
-        //    who set the value of inArrayOperator to true.
-        // 3. No compound indices are used and no bounds are combined.  These are incorrect in the context
-        //    of these operators.
-        //
-
-        /**
-         * If 'inArrayOperator' is false, takes ownership of 'root'.
-         */
-        static QuerySolutionNode* buildIndexedDataAccess(const CanonicalQuery& query,
-                                                         MatchExpression* root,
-                                                         bool inArrayOperator,
-                                                         const vector<IndexEntry>& indices);
-
-        /**
-         * Takes ownership of 'root'.
-         */
-        static QuerySolutionNode* buildIndexedAnd(const CanonicalQuery& query,
-                                                  MatchExpression* root,
-                                                  bool inArrayOperator,
-                                                  const vector<IndexEntry>& indices);
-
-        /**
-         * Takes ownership of 'root'.
-         */
-        static QuerySolutionNode* buildIndexedOr(const CanonicalQuery& query,
-                                                 MatchExpression* root,
-                                                 bool inArrayOperator,
-                                                 const vector<IndexEntry>& indices);
-
-        /**
-         * Helper used by buildIndexedAnd and buildIndexedOr.
-         *
-         * The children of AND and OR nodes are sorted by the index that the subtree rooted at
-         * that node uses.  Child nodes that use the same index are adjacent to one another to
-         * facilitate grouping of index scans.  As such, the processing for AND and OR is
-         * almost identical.
-         *
-         * See tagForSort and sortUsingTags in index_tag.h for details on ordering the children
-         * of OR and AND.
-         *
-         * Does not take ownership of 'root' but may remove children from it.
-         */
-        static bool processIndexScans(const CanonicalQuery& query,
-                                      MatchExpression* root,
-                                      bool inArrayOperator,
-                                      const vector<IndexEntry>& indices,
-                                      vector<QuerySolutionNode*>* out);
-
-        //
-        // Helpers for creating an index scan.
-        //
-
-        /**
-         * Create a new data access node.
-         *
-         * If the node is an index scan, the bounds for 'expr' are computed and placed into the
-         * first field's OIL position.  The rest of the OILs are allocated but uninitialized.
-         *
-         * If the node is a geo node, grab the geo data from 'expr' and stuff it into the
-         * geo solution node of the appropriate type.
-         */
-        static QuerySolutionNode* makeLeafNode(const IndexEntry& index,
-                                               MatchExpression* expr,
-                                               bool* exact);
-
-        /**
-         * Merge the predicate 'expr' with the leaf node 'node'.
-         */
-        static void mergeWithLeafNode(MatchExpression* expr, const IndexEntry& index,
-                                      size_t pos, bool* exactOut, QuerySolutionNode* node,
-                                      MatchExpression::MatchType mergeType);
-
-        /**
-         * If index scan (regular or expression index), fill in any bounds that are missing in
-         * 'node' with the "all values for this field" interval.
-         *
-         * If geo, do nothing.
-         */
-        static void finishLeafNode(QuerySolutionNode* node, const IndexEntry& index);
-
-        //
-        // Analysis of Data Access
-        //
-
-        /**
-         * In brief: performs sort and covering analysis.
-         *
-         * The solution rooted at 'solnRoot' provides data for the query, whether through some
-         * configuration of indices or through a collection scan.  Additional stages may be required
-         * to perform sorting, projection, or other operations that are independent of the source
-         * of the data.  These stages are added atop 'solnRoot'.
-         *
-         * 'taggedRoot' is a copy of the parse tree.  Nodes in 'solnRoot' may point into it.
-         *
-         * Takes ownership of 'solnRoot' and 'taggedRoot'.
-         *
-         * Caller owns the returned QuerySolution.
-         */
-        static QuerySolution* analyzeDataAccess(const CanonicalQuery& query,
-                                                const QueryPlannerParams& params,
-                                                QuerySolutionNode* solnRoot);
-
-        /**
-         * Return a plan that uses the provided index as a proxy for a collection scan.
-         */
-        static QuerySolution* scanWholeIndex(const IndexEntry& index,
-                                             const CanonicalQuery& query,
-                                             const QueryPlannerParams& params,
-                                             int direction = 1);
-
-        /**
-         * Traverse the tree rooted at 'root' reversing ixscans and other sorts.
-         */
-        static void reverseScans(QuerySolutionNode* root);
-
-        /**
-         * Assumes each OIL in bounds is increasing.
-         *
-         * Aligns OILs (and bounds) according to the kp direction * the scanDir.
-         */
-        static void alignBounds(IndexBounds* bounds, const BSONObj& kp, int scanDir = 1);
-
-        /**
-         * Does the index with key pattern 'kp' provide the sort that 'query' wants?
-         */
-        static bool providesSort(const CanonicalQuery& query, const BSONObj& kp);
-
-        /**
-         * Get the bounds for the sort in 'query' used by the sort stage.  Output the bounds
-         * in 'node'.
-         */
-        static void getBoundsForSort(const CanonicalQuery& query, SortNode* node);
+        // Estimate information for all QuerySolutionNodes in all the plans which we were able to
+        // cost. This may include some plans in 'solutions' and all of the plans in 'rejectedPlans'.
+        // If two plans contain identical QSNs, they are treated as separate entries in this map.
+        cost_based_ranker::EstimateMap estimates;
     };
+
+    /**
+     * Given a CanonicalQuery and a QSN tree, creates QSN nodes for each pipeline stage in 'query'
+     * and grafts them on top of the existing QSN tree. If 'query' has an empty pipeline, this
+     * function is a noop.
+     */
+    static std::unique_ptr<QuerySolution> extendWithAggPipeline(
+        CanonicalQuery& query,
+        std::unique_ptr<QuerySolution>&& solution,
+        const std::map<NamespaceString, CollectionInfo>& secondaryCollInfos);
+
+    /**
+     * Returns the list of possible query solutions for the provided 'query' for multi-planning.
+     * Uses the indices and other data in 'params' to determine the set of available plans.
+     */
+    static StatusWith<std::vector<std::unique_ptr<QuerySolution>>> plan(
+        const CanonicalQuery& query, const QueryPlannerParams& params);
+
+    /**
+     * Invokes 'QueryPlanner::plan()' to enumerate the set of possible plans. Then estimate each
+     * plan's cost using the cardinality estimation (CE) and costing modules. The return value
+     * contains a list of plans that were rejected on the basis of cost, as well as any non-rejected
+     * plans from which the caller can select a winner.
+     */
+    static StatusWith<CostBasedRankerResult> planWithCostBasedRanking(
+        const CanonicalQuery& query,
+        const QueryPlannerParams& params,
+        const ce::SamplingEstimator* samplingEstimator);
+
+    /**
+     * Generates and returns a query solution, given data retrieved from the plan cache.
+     *
+     * @param query -- query for which we are generating a plan
+     * @param params -- planning parameters
+     * @param cachedSoln -- the CachedSolution retrieved from the plan cache.
+     */
+    static StatusWith<std::unique_ptr<QuerySolution>> planFromCache(
+        const CanonicalQuery& query,
+        const QueryPlannerParams& params,
+        const SolutionCacheData& solnCacheData);
+
+    /**
+     * Plan each branch of the rooted $or query independently, and return the resulting
+     * lists of query solutions in 'SubqueriesPlanningResult'.
+     *
+     * The 'createPlanCacheKey' callback is used to create a plan cache key of the specified
+     * 'KeyType' for each of the branches to look up the plan in the 'planCache'.
+     */
+    static StatusWith<SubqueriesPlanningResult> planSubqueries(
+        OperationContext* opCtx,
+        std::function<std::unique_ptr<SolutionCacheData>(
+            const CanonicalQuery& cq, const CollectionPtr& coll)> getSolutionCachedData,
+        const CollectionPtr& collection,
+        const CanonicalQuery& query,
+        const QueryPlannerParams& params,
+        const ce::SamplingEstimator* samplingEstimator);
+
+    /**
+     * Generates and returns the index tag tree that will be inserted into the plan cache. This data
+     * gets stashed inside a QuerySolution until it can be inserted into the cache proper.
+     *
+     * @param taggedTree -- a MatchExpression with index tags that has been
+     *   produced by the enumerator.
+     * @param relevantIndices -- a list of the index entries used to tag
+     *   the tree (i.e. index numbers in the tags refer to entries in this vector)
+     */
+    static StatusWith<std::unique_ptr<PlanCacheIndexTree>> cacheDataFromTaggedTree(
+        const MatchExpression* taggedTree, const std::vector<IndexEntry>& relevantIndices);
+
+    /**
+     * @param filter -- an untagged MatchExpression
+     * @param indexTree -- a tree structure retrieved from the
+     *   cache with index tags that indicates how 'filter' should
+     *   be tagged.
+     * @param indexMap -- needed in order to put the proper index
+     *   numbers inside the index tags
+     *
+     * On success, 'filter' is mutated so that it has all the
+     * index tags needed in order for the access planner to recreate
+     * the cached plan.
+     *
+     * On failure, the tag state attached to the nodes of 'filter'
+     * is invalid. Planning from the cache should be aborted.
+     *
+     * Does not take ownership of either filter or indexTree.
+     */
+    static Status tagAccordingToCache(MatchExpression* filter,
+                                      const PlanCacheIndexTree* indexTree,
+                                      const std::map<IndexEntry::Identifier, size_t>& indexMap);
+
+    /**
+     * Uses the query planning results from QueryPlanner::planSubqueries() and the multi planner
+     * callback to select the best plan for each branch.
+     *
+     * On success, returns a composite solution obtained by planning each $or branch independently.
+     */
+    static StatusWith<std::unique_ptr<QuerySolution>> choosePlanForSubqueries(
+        const CanonicalQuery& query,
+        const QueryPlannerParams& params,
+        QueryPlanner::SubqueriesPlanningResult planningResult,
+        std::function<StatusWith<std::unique_ptr<QuerySolution>>(
+            CanonicalQuery* cq, std::vector<std::unique_ptr<QuerySolution>>)> multiplanCallback);
+};
 
 }  // namespace mongo

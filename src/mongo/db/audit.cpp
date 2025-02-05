@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,189 +29,318 @@
 
 #include "mongo/db/audit.h"
 
-#if MONGO_ENTERPRISE_VERSION
-#define MONGO_AUDIT_STUB ;
-#else
-#define MONGO_AUDIT_STUB {}
-#endif
+#include "mongo/db/audit_interface.h"
+#include "mongo/db/service_context.h"
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace audit {
+std::function<void(OperationContext*)> initializeManager;
+std::function<void(OpObserverRegistry*)> opObserverRegistrar;
+std::function<void(ServiceContext*)> initializeSynchronizeJob;
+std::function<void()> shutdownSynchronizeJob;
 
-    void logAuthentication(ClientBasic* client,
-                           const StringData& mechanism,
-                           const UserName& user,
-                           ErrorCodes::Error result) MONGO_AUDIT_STUB
+#if !MONGO_ENTERPRISE_AUDIT
+ImpersonatedClientAttrs::ImpersonatedClientAttrs(Client* client) {}
+void rotateAuditLog() {}
+#endif
 
-    void logCommandAuthzCheck(ClientBasic* client,
+namespace {
+const auto getAuditInterface = ServiceContext::declareDecoration<std::unique_ptr<AuditInterface>>();
+ServiceContext::ConstructorActionRegisterer registerCreateNoopAudit{
+    "initializeNoopAuditInterface", [](ServiceContext* svcCtx) {
+        AuditInterface::set(svcCtx, std::make_unique<AuditNoOp>());
+    }};
+}  // namespace
+
+AuditInterface* AuditInterface::get(ServiceContext* service) {
+    return getAuditInterface(service).get();
+}
+
+void AuditInterface::set(ServiceContext* service, std::unique_ptr<AuditInterface> interface) {
+    getAuditInterface(service) = std::move(interface);
+}
+
+
+void logClientMetadata(Client* client) {
+    AuditInterface::get(client->getServiceContext())->logClientMetadata(client);
+}
+
+void logAuthentication(Client* client, const AuthenticateEvent& event) {
+    AuditInterface::get(client->getServiceContext())->logAuthentication(client, event);
+}
+
+void logCommandAuthzCheck(Client* client,
+                          const OpMsgRequest& cmdObj,
+                          const CommandInterface& command,
+                          ErrorCodes::Error result) {
+    AuditInterface::get(client->getServiceContext())
+        ->logCommandAuthzCheck(client, cmdObj, command, result);
+}
+
+void logKillCursorsAuthzCheck(Client* client,
                               const NamespaceString& ns,
-                              const mutablebson::Document& cmdObj,
-                              ErrorCodes::Error result) MONGO_AUDIT_STUB
+                              long long cursorId,
+                              ErrorCodes::Error result) {
+    AuditInterface::get(client->getServiceContext())
+        ->logKillCursorsAuthzCheck(client, ns, cursorId, result);
+}
 
-    void logDeleteAuthzCheck(
-            ClientBasic* client,
-            const NamespaceString& ns,
-            const BSONObj& pattern,
-            ErrorCodes::Error result) MONGO_AUDIT_STUB
+void logCreateUser(Client* client,
+                   const UserName& username,
+                   bool password,
+                   const BSONObj* customData,
+                   const std::vector<RoleName>& roles,
+                   const boost::optional<BSONArray>& restrictions) {
+    AuditInterface::get(client->getServiceContext())
+        ->logCreateUser(client, username, password, customData, roles, restrictions);
+}
 
-    void logFsyncUnlockAuthzCheck(
-            ClientBasic* client,
-            ErrorCodes::Error result) MONGO_AUDIT_STUB
+void logDropUser(Client* client, const UserName& username) {
+    AuditInterface::get(client->getServiceContext())->logDropUser(client, username);
+}
 
-    void logGetMoreAuthzCheck(
-            ClientBasic* client,
-            const NamespaceString& ns,
-            long long cursorId,
-            ErrorCodes::Error result) MONGO_AUDIT_STUB
+void logDropAllUsersFromDatabase(Client* client, const DatabaseName& dbname) {
+    AuditInterface::get(client->getServiceContext())->logDropAllUsersFromDatabase(client, dbname);
+}
 
-    void logInProgAuthzCheck(
-            ClientBasic* client,
-            const BSONObj& filter,
-            ErrorCodes::Error result) MONGO_AUDIT_STUB
+void logUpdateUser(Client* client,
+                   const UserName& username,
+                   bool password,
+                   const BSONObj* customData,
+                   const std::vector<RoleName>* roles,
+                   const boost::optional<BSONArray>& restrictions) {
+    AuditInterface::get(client->getServiceContext())
+        ->logUpdateUser(client, username, password, customData, roles, restrictions);
+}
 
-    void logInsertAuthzCheck(
-            ClientBasic* client,
-            const NamespaceString& ns,
-            const BSONObj& insertedObj,
-            ErrorCodes::Error result) MONGO_AUDIT_STUB
+void logGrantRolesToUser(Client* client,
+                         const UserName& username,
+                         const std::vector<RoleName>& roles) {
+    AuditInterface::get(client->getServiceContext())->logGrantRolesToUser(client, username, roles);
+}
 
-    void logKillCursorsAuthzCheck(
-            ClientBasic* client,
-            const NamespaceString& ns,
-            long long cursorId,
-            ErrorCodes::Error result) MONGO_AUDIT_STUB
+void logRevokeRolesFromUser(Client* client,
+                            const UserName& username,
+                            const std::vector<RoleName>& roles) {
+    AuditInterface::get(client->getServiceContext())
+        ->logRevokeRolesFromUser(client, username, roles);
+}
 
-    void logKillOpAuthzCheck(
-            ClientBasic* client,
-            const BSONObj& filter,
-            ErrorCodes::Error result) MONGO_AUDIT_STUB
+void logCreateRole(Client* client,
+                   const RoleName& role,
+                   const std::vector<RoleName>& roles,
+                   const PrivilegeVector& privileges,
+                   const boost::optional<BSONArray>& restrictions) {
+    AuditInterface::get(client->getServiceContext())
+        ->logCreateRole(client, role, roles, privileges, restrictions);
+}
 
-    void logQueryAuthzCheck(
-            ClientBasic* client,
-            const NamespaceString& ns,
-            const BSONObj& query,
-            ErrorCodes::Error result) MONGO_AUDIT_STUB
+void logUpdateRole(Client* client,
+                   const RoleName& role,
+                   const std::vector<RoleName>* roles,
+                   const PrivilegeVector* privileges,
+                   const boost::optional<BSONArray>& restrictions) {
+    AuditInterface::get(client->getServiceContext())
+        ->logUpdateRole(client, role, roles, privileges, restrictions);
+}
 
-    void logUpdateAuthzCheck(
-            ClientBasic* client,
-            const NamespaceString& ns,
-            const BSONObj& query,
-            const BSONObj& updateObj,
-            bool isUpsert,
-            bool isMulti,
-            ErrorCodes::Error result) MONGO_AUDIT_STUB
+void logDropRole(Client* client, const RoleName& role) {
+    AuditInterface::get(client->getServiceContext())->logDropRole(client, role);
+}
 
-    void logCreateUser(ClientBasic* client,
-                       const UserName& username,
-                       bool password,
-                       const BSONObj* customData,
-                       const std::vector<RoleName>& roles) MONGO_AUDIT_STUB
+void logDropAllRolesFromDatabase(Client* client, const DatabaseName& dbname) {
+    AuditInterface::get(client->getServiceContext())->logDropAllRolesFromDatabase(client, dbname);
+}
 
-    void logDropUser(ClientBasic* client,
-                     const UserName& username) MONGO_AUDIT_STUB
+void logGrantRolesToRole(Client* client, const RoleName& role, const std::vector<RoleName>& roles) {
+    AuditInterface::get(client->getServiceContext())->logGrantRolesToRole(client, role, roles);
+}
 
-    void logDropAllUsersFromDatabase(ClientBasic* client,
-                                     const StringData& dbname) MONGO_AUDIT_STUB
+void logRevokeRolesFromRole(Client* client,
+                            const RoleName& role,
+                            const std::vector<RoleName>& roles) {
+    AuditInterface::get(client->getServiceContext())->logRevokeRolesFromRole(client, role, roles);
+}
 
-    void logUpdateUser(ClientBasic* client,
-                       const UserName& username,
-                       bool password,
-                       const BSONObj* customData,
-                       const std::vector<RoleName>* roles) MONGO_AUDIT_STUB
+void logGrantPrivilegesToRole(Client* client,
+                              const RoleName& role,
+                              const PrivilegeVector& privileges) {
+    AuditInterface::get(client->getServiceContext())
+        ->logGrantPrivilegesToRole(client, role, privileges);
+}
 
-    void logGrantRolesToUser(ClientBasic* client,
-                             const UserName& username,
-                             const std::vector<RoleName>& roles) MONGO_AUDIT_STUB
+void logRevokePrivilegesFromRole(Client* client,
+                                 const RoleName& role,
+                                 const PrivilegeVector& privileges) {
+    AuditInterface::get(client->getServiceContext())
+        ->logRevokePrivilegesFromRole(client, role, privileges);
+}
 
-    void logRevokeRolesFromUser(ClientBasic* client,
-                                const UserName& username,
-                                const std::vector<RoleName>& roles) MONGO_AUDIT_STUB
+void logReplSetReconfig(Client* client, const BSONObj* oldConfig, const BSONObj* newConfig) {
+    AuditInterface::get(client->getServiceContext())
+        ->logReplSetReconfig(client, oldConfig, newConfig);
+}
 
-    void logCreateRole(ClientBasic* client,
-                       const RoleName& role,
-                       const std::vector<RoleName>& roles,
-                       const PrivilegeVector& privileges) MONGO_AUDIT_STUB
+void logApplicationMessage(Client* client, StringData msg) {
+    AuditInterface::get(client->getServiceContext())->logApplicationMessage(client, msg);
+}
 
-    void logUpdateRole(ClientBasic* client,
-                       const RoleName& role,
-                       const std::vector<RoleName>* roles,
-                       const PrivilegeVector* privileges) MONGO_AUDIT_STUB
+void logStartupOptions(Client* client, const BSONObj& startupOptions) {
+    AuditInterface::get(client->getServiceContext())->logStartupOptions(client, startupOptions);
+}
 
-    void logDropRole(ClientBasic* client,
-                     const RoleName& role) MONGO_AUDIT_STUB
+void logShutdown(Client* client) {
+    AuditInterface::get(client->getServiceContext())->logShutdown(client);
+}
 
-    void logDropAllRolesFromDatabase(ClientBasic* client,
-                                     const StringData& dbname) MONGO_AUDIT_STUB
+void logLogout(Client* client,
+               StringData reason,
+               const BSONArray& initialUsers,
+               const BSONArray& updatedUsers,
+               const boost::optional<Date_t>& loginTime) {
+    AuditInterface::get(client->getServiceContext())
+        ->logLogout(client, reason, initialUsers, updatedUsers, loginTime);
+}
 
-    void logGrantRolesToRole(ClientBasic* client,
-                             const RoleName& role,
-                             const std::vector<RoleName>& roles) MONGO_AUDIT_STUB
+void logCreateIndex(Client* client,
+                    const BSONObj* indexSpec,
+                    StringData indexname,
+                    const NamespaceString& nsname,
+                    StringData indexBuildState,
+                    ErrorCodes::Error result) {
+    AuditInterface::get(client->getServiceContext())
+        ->logCreateIndex(client, indexSpec, indexname, nsname, indexBuildState, result);
+}
 
-    void logRevokeRolesFromRole(ClientBasic* client,
-                                const RoleName& role,
-                                const std::vector<RoleName>& roles) MONGO_AUDIT_STUB
+void logCreateCollection(Client* client, const NamespaceString& nsname) {
+    AuditInterface::get(client->getServiceContext())->logCreateCollection(client, nsname);
+}
 
-    void logGrantPrivilegesToRole(ClientBasic* client,
-                                  const RoleName& role,
-                                  const PrivilegeVector& privileges) MONGO_AUDIT_STUB
+void logCreateView(Client* client,
+                   const NamespaceString& nsname,
+                   const NamespaceString& viewOn,
+                   BSONArray pipeline,
+                   ErrorCodes::Error code) {
+    AuditInterface::get(client->getServiceContext())
+        ->logCreateView(client, nsname, viewOn, pipeline, code);
+}
 
-    void logRevokePrivilegesFromRole(ClientBasic* client,
-                                     const RoleName& role,
-                                     const PrivilegeVector& privileges) MONGO_AUDIT_STUB
+void logImportCollection(Client* client, const NamespaceString& nsname) {
+    AuditInterface::get(client->getServiceContext())->logImportCollection(client, nsname);
+}
 
-    void logReplSetReconfig(ClientBasic* client,
-                            const BSONObj* oldConfig,
-                            const BSONObj* newConfig) MONGO_AUDIT_STUB
-
-    void logApplicationMessage(ClientBasic* client,
-                               const StringData& msg) MONGO_AUDIT_STUB
-
-    void logShutdown(ClientBasic* client) MONGO_AUDIT_STUB
-
-    void logAuditLogRotate(ClientBasic* client,
-                           const StringData& file) MONGO_AUDIT_STUB
-
-    void logCreateIndex(ClientBasic* client,
-                        const BSONObj* indexSpec,
-                        const StringData& indexname,
-                        const StringData& nsname) MONGO_AUDIT_STUB
-
-    void logCreateCollection(ClientBasic* client,
-                             const StringData& nsname) MONGO_AUDIT_STUB
-
-    void logCreateDatabase(ClientBasic* client,
-                           const StringData& dbname) MONGO_AUDIT_STUB
+void logCreateDatabase(Client* client, const DatabaseName& dbname) {
+    AuditInterface::get(client->getServiceContext())->logCreateDatabase(client, dbname);
+}
 
 
-    void logDropIndex(ClientBasic* client,
-                      const StringData& indexname,
-                      const StringData& nsname) MONGO_AUDIT_STUB
+void logDropIndex(Client* client, StringData indexname, const NamespaceString& nsname) {
+    AuditInterface::get(client->getServiceContext())->logDropIndex(client, indexname, nsname);
+}
 
-    void logDropCollection(ClientBasic* client,
-                           const StringData& nsname) MONGO_AUDIT_STUB
+void logDropCollection(Client* client, const NamespaceString& nsname) {
+    AuditInterface::get(client->getServiceContext())->logDropCollection(client, nsname);
+}
 
-    void logDropDatabase(ClientBasic* client,
-                         const StringData& dbname) MONGO_AUDIT_STUB
+void logDropView(Client* client,
+                 const NamespaceString& nsname,
+                 const NamespaceString& viewOn,
+                 const std::vector<BSONObj>& pipeline,
+                 ErrorCodes::Error code) {
+    AuditInterface::get(client->getServiceContext())
+        ->logDropView(client, nsname, viewOn, pipeline, code);
+}
 
-    void logRenameCollection(ClientBasic* client,
-                             const StringData& source,
-                             const StringData& target) MONGO_AUDIT_STUB
+void logDropDatabase(Client* client, const DatabaseName& dbname) {
+    AuditInterface::get(client->getServiceContext())->logDropDatabase(client, dbname);
+}
 
-    void logEnableSharding(ClientBasic* client,
-                           const StringData& dbname) MONGO_AUDIT_STUB
+void logRenameCollection(Client* client,
+                         const NamespaceString& source,
+                         const NamespaceString& target) {
+    AuditInterface::get(client->getServiceContext())->logRenameCollection(client, source, target);
+}
 
-    void logAddShard(ClientBasic* client,
-                     const StringData& name,
-                     const std::string& servers,
-                     long long maxsize) MONGO_AUDIT_STUB
+void logEnableSharding(Client* client, StringData dbname) {
+    AuditInterface::get(client->getServiceContext())->logEnableSharding(client, dbname);
+}
 
-    void logRemoveShard(ClientBasic* client,
-                        const StringData& shardname) MONGO_AUDIT_STUB
+void logAddShard(Client* client, StringData name, const std::string& servers) {
+    AuditInterface::get(client->getServiceContext())->logAddShard(client, name, servers);
+}
 
-    void logShardCollection(ClientBasic* client,
-                            const StringData& ns,
-                            const BSONObj& keyPattern,
-                            bool unique) MONGO_AUDIT_STUB
+void logRemoveShard(Client* client, StringData shardname) {
+    AuditInterface::get(client->getServiceContext())->logRemoveShard(client, shardname);
+}
+
+void logShardCollection(Client* client,
+                        const NamespaceString& ns,
+                        const BSONObj& keyPattern,
+                        bool unique) {
+    AuditInterface::get(client->getServiceContext())
+        ->logShardCollection(client, ns, keyPattern, unique);
+}
+
+void logRefineCollectionShardKey(Client* client,
+                                 const NamespaceString& ns,
+                                 const BSONObj& keyPattern) {
+    AuditInterface::get(client->getServiceContext())
+        ->logRefineCollectionShardKey(client, ns, keyPattern);
+}
+
+void logInsertOperation(Client* client, const NamespaceString& nss, const BSONObj& doc) {
+    AuditInterface::get(client->getServiceContext())->logInsertOperation(client, nss, doc);
+}
+
+void logUpdateOperation(Client* client, const NamespaceString& nss, const BSONObj& doc) {
+    AuditInterface::get(client->getServiceContext())->logUpdateOperation(client, nss, doc);
+}
+
+void logRemoveOperation(Client* client, const NamespaceString& nss, const BSONObj& doc) {
+    AuditInterface::get(client->getServiceContext())->logRemoveOperation(client, nss, doc);
+}
+
+void logGetClusterParameter(
+    Client* client,
+    const std::variant<std::string, std::vector<std::string>>& requestedParameters) {
+    AuditInterface::get(client->getServiceContext())
+        ->logGetClusterParameter(client, requestedParameters);
+}
+
+void logSetClusterParameter(Client* client,
+                            const BSONObj& oldValue,
+                            const BSONObj& newValue,
+                            const boost::optional<TenantId>& tenantId) {
+    AuditInterface::get(client->getServiceContext())
+        ->logSetClusterParameter(client, oldValue, newValue, tenantId);
+}
+
+void logUpdateCachedClusterParameter(Client* client,
+                                     const BSONObj& oldValue,
+                                     const BSONObj& newValue,
+                                     const boost::optional<TenantId>& tenantId) {
+    AuditInterface::get(client->getServiceContext())
+        ->logUpdateCachedClusterParameter(client, oldValue, newValue, tenantId);
+}
+
+void logRotateLog(Client* client,
+                  const Status& logStatus,
+                  const std::vector<Status>& errors,
+                  const std::string& suffix) {
+    // During startup, client hasn't been created. We get the serviceContext from the client when we
+    // can
+    if (client != nullptr) {
+        AuditInterface::get(client->getServiceContext())
+            ->logRotateLog(client, logStatus, errors, suffix);
+    } else {
+        AuditInterface::get(getGlobalServiceContext())
+            ->logRotateLog(client, logStatus, errors, suffix);
+    }
+}
+
 }  // namespace audit
 }  // namespace mongo
-

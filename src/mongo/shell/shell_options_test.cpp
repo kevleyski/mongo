@@ -1,366 +1,87 @@
-/* Copyright 2013 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
+#include <cstring>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "mongo/shell/shell_options.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
-#include "mongo/bson/util/builder.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/options_parser/options_parser.h"
-#include "mongo/util/options_parser/startup_options.h"
-
+namespace mongo {
 namespace {
 
-    namespace moe = ::mongo::optionenvironment;
+TEST(ShellOptions, RedactPasswords) {
+    std::vector<std::pair<std::vector<std::string>, const std::vector<StringData>>> testData = {
+        // Check that just passwords get redacted correctly
+        {{"-u", "admin", "-p", "password", "--port", "27017"},                     // NOLINT
+         {"-u"_sd, "admin"_sd, "-p"_sd, "xxxxxxxx"_sd, "--port"_sd, "27017"_sd}},  // NOLINT
+        // Check that passwords and URIs get redacted correctly
+        {{"-p", "password", "mongodb://admin:password@localhost"},  // NOLINT
+         {"-p"_sd, "xxxxxxxx", "mongodb://admin@localhost"_sd}},    // NOLINT
+        // Check that just URIs get redacted correctly
+        {{"mongodb://admin:password@localhost"},  // NOLINT
+         {"mongodb://admin@localhost"_sd}},       // NOLINT
+        // Sanity check that non-passwords don't get redacted
+        {{"localhost"},      // NOLINT
+         {"localhost"_sd}},  // NOLINT
+        // Sanity check that we don't overflow argv
+        {{"-p"},      // NOLINT
+         {"-p"_sd}},  // NOLINT
+        // Check for --passsword=foo
+        {{"--password=foo"},      // NOLINT
+         {"--password=xxx"_sd}},  // NOLINT
+        {{"-ppassword"},          // NOLINT
+         {"-pxxxxxxxx"}},         // NOLINT
+        // Having --password at the end of the parameters list should do nothing since it means
+        // prompt for password
+        {{"mongodb://admin@localhost/admin", "--password"},         // NOLINT
+         {"mongodb://admin@localhost/admin"_sd, "--password"_sd}},  // NOLINT
+    };
 
-    TEST(Registration, RegisterAllOptions) {
+    for (auto& testCase : testData) {
+        // Sanity check for the test data
+        ASSERT_EQ(testCase.first.size(), testCase.second.size());
+        std::vector<char*> argv;
+        for (const auto& arg : testCase.first) {
+            argv.push_back(const_cast<char*>(&arg.front()));
+        }
 
-        moe::OptionSection options;
-
-        ASSERT_OK(::mongo::addMongoShellOptions(&options));
-
-        std::vector<moe::OptionDescription> options_vector;
-        ASSERT_OK(options.getAllOptions(&options_vector));
-
-        for(std::vector<moe::OptionDescription>::const_iterator iterator = options_vector.begin();
-            iterator != options_vector.end(); iterator++) {
-
-            if (iterator->_dottedName == "shell") {
-                ASSERT_EQUALS(iterator->_singleName, "shell");
-                ASSERT_EQUALS(iterator->_type, moe::Switch);
-                ASSERT_EQUALS(iterator->_description, "run the shell after executing files");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "nodb") {
-                ASSERT_EQUALS(iterator->_singleName, "nodb");
-                ASSERT_EQUALS(iterator->_type, moe::Switch);
-                ASSERT_EQUALS(iterator->_description, "don't connect to mongod on startup - no 'db address' arg expected");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "norc") {
-                ASSERT_EQUALS(iterator->_singleName, "norc");
-                ASSERT_EQUALS(iterator->_type, moe::Switch);
-                ASSERT_EQUALS(iterator->_description, "will not run the \".mongorc.js\" file on start up");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "quiet") {
-                ASSERT_EQUALS(iterator->_singleName, "quiet");
-                ASSERT_EQUALS(iterator->_type, moe::Switch);
-                ASSERT_EQUALS(iterator->_description, "be less chatty");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "port") {
-                ASSERT_EQUALS(iterator->_singleName, "port");
-                ASSERT_EQUALS(iterator->_type, moe::String);
-                ASSERT_EQUALS(iterator->_description, "port to connect to");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "host") {
-                ASSERT_EQUALS(iterator->_singleName, "host");
-                ASSERT_EQUALS(iterator->_type, moe::String);
-                ASSERT_EQUALS(iterator->_description, "server to connect to");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "eval") {
-                ASSERT_EQUALS(iterator->_singleName, "eval");
-                ASSERT_EQUALS(iterator->_type, moe::String);
-                ASSERT_EQUALS(iterator->_description, "evaluate javascript");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "username") {
-                ASSERT_EQUALS(iterator->_singleName, "username,u");
-                ASSERT_EQUALS(iterator->_type, moe::String);
-                ASSERT_EQUALS(iterator->_description, "username for authentication");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "password") {
-                ASSERT_EQUALS(iterator->_singleName, "password,p");
-                ASSERT_EQUALS(iterator->_type, moe::String);
-                ASSERT_EQUALS(iterator->_description, "password for authentication");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                moe::Value implicitVal(std::string(""));
-                ASSERT_TRUE(iterator->_implicit.equal(implicitVal));
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "authenticationDatabase") {
-                ASSERT_EQUALS(iterator->_singleName, "authenticationDatabase");
-                ASSERT_EQUALS(iterator->_type, moe::String);
-                ASSERT_EQUALS(iterator->_description, "user source (defaults to dbname)");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                moe::Value defaultVal(std::string(""));
-                ASSERT_TRUE(iterator->_default.equal(defaultVal));
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "authenticationMechanism") {
-                ASSERT_EQUALS(iterator->_singleName, "authenticationMechanism");
-                ASSERT_EQUALS(iterator->_type, moe::String);
-                ASSERT_EQUALS(iterator->_description, "authentication mechanism");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                moe::Value defaultVal(std::string("MONGODB-CR"));
-                ASSERT_TRUE(iterator->_default.equal(defaultVal));
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "help") {
-                ASSERT_EQUALS(iterator->_singleName, "help,h");
-                ASSERT_EQUALS(iterator->_type, moe::Switch);
-                ASSERT_EQUALS(iterator->_description, "show this usage information");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "version") {
-                ASSERT_EQUALS(iterator->_singleName, "version");
-                ASSERT_EQUALS(iterator->_type, moe::Switch);
-                ASSERT_EQUALS(iterator->_description, "show version information");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "verbose") {
-                ASSERT_EQUALS(iterator->_singleName, "verbose");
-                ASSERT_EQUALS(iterator->_type, moe::Switch);
-                ASSERT_EQUALS(iterator->_description, "increase verbosity");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "ipv6") {
-                ASSERT_EQUALS(iterator->_singleName, "ipv6");
-                ASSERT_EQUALS(iterator->_type, moe::Switch);
-                ASSERT_EQUALS(iterator->_description, "enable IPv6 support (disabled by default)");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "dbaddress") {
-                ASSERT_EQUALS(iterator->_singleName, "dbaddress");
-                ASSERT_EQUALS(iterator->_type, moe::String);
-                ASSERT_EQUALS(iterator->_description, "dbaddress");
-                ASSERT_EQUALS(iterator->_isVisible, false);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, 1);
-                ASSERT_EQUALS(iterator->_positionalEnd, 1);
-            }
-            else if (iterator->_dottedName == "files") {
-                ASSERT_EQUALS(iterator->_singleName, "files");
-                ASSERT_EQUALS(iterator->_type, moe::StringVector);
-                ASSERT_EQUALS(iterator->_description, "files");
-                ASSERT_EQUALS(iterator->_isVisible, false);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, 2);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "nokillop") {
-                ASSERT_EQUALS(iterator->_singleName, "nokillop");
-                ASSERT_EQUALS(iterator->_type, moe::Switch);
-                ASSERT_EQUALS(iterator->_description, "nokillop");
-                ASSERT_EQUALS(iterator->_isVisible, false);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "autokillop") {
-                ASSERT_EQUALS(iterator->_singleName, "autokillop");
-                ASSERT_EQUALS(iterator->_type, moe::Switch);
-                ASSERT_EQUALS(iterator->_description, "autokillop");
-                ASSERT_EQUALS(iterator->_isVisible, false);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "useLegacyWriteOps") {
-                ASSERT_EQUALS(iterator->_singleName, "useLegacyWriteOps");
-                ASSERT_EQUALS(iterator->_type, moe::Switch);
-                ASSERT_EQUALS(iterator->_description,
-                              "use legacy write ops instead of write commands");
-                ASSERT_EQUALS(iterator->_isVisible, false);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-#ifdef MONGO_SSL
-            else if (iterator->_dottedName == "ssl") {
-                ASSERT_EQUALS(iterator->_singleName, "ssl");
-                ASSERT_EQUALS(iterator->_type, moe::Switch);
-                ASSERT_EQUALS(iterator->_description, "use SSL for all connections");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "ssl.CAFile") {
-                ASSERT_EQUALS(iterator->_singleName, "sslCAFile");
-                ASSERT_EQUALS(iterator->_type, moe::String);
-                ASSERT_EQUALS(iterator->_description, "Certificate Authority file for SSL");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "ssl.PEMKeyFile") {
-                ASSERT_EQUALS(iterator->_singleName, "sslPEMKeyFile");
-                ASSERT_EQUALS(iterator->_type, moe::String);
-                ASSERT_EQUALS(iterator->_description, "PEM certificate/key file for SSL");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "ssl.PEMKeyPassword") {
-                ASSERT_EQUALS(iterator->_singleName, "sslPEMKeyPassword");
-                ASSERT_EQUALS(iterator->_type, moe::String);
-                ASSERT_EQUALS(iterator->_description, "password for key in PEM file for SSL");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "ssl.CRLFile") {
-                ASSERT_EQUALS(iterator->_singleName, "sslCRLFile");
-                ASSERT_EQUALS(iterator->_type, moe::String);
-                ASSERT_EQUALS(iterator->_description, "Certificate Revocation List file for SSL");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-            else if (iterator->_dottedName == "ssl.FIPSMode") {
-                ASSERT_EQUALS(iterator->_singleName, "sslFIPSMode");
-                ASSERT_EQUALS(iterator->_type, moe::Switch);
-                ASSERT_EQUALS(iterator->_description, "activate FIPS 140-2 mode at startup");
-                ASSERT_EQUALS(iterator->_isVisible, true);
-                ASSERT_TRUE(iterator->_default.isEmpty());
-                ASSERT_TRUE(iterator->_implicit.isEmpty());
-                ASSERT_EQUALS(iterator->_isComposing, false);
-                ASSERT_EQUALS(iterator->_sources, moe::SourceAll);
-                ASSERT_EQUALS(iterator->_positionalStart, -1);
-                ASSERT_EQUALS(iterator->_positionalEnd, -1);
-            }
-#endif
-            else {
-                ::mongo::StringBuilder sb;
-                sb << "Found extra option: " << iterator->_dottedName <<
-                      " which we did not register";
-                FAIL(sb.str());
-            }
+        redactPasswordOptions(argv.size(), &argv.front());
+        for (size_t i = 0; i < testCase.first.size(); i++) {
+            auto shrunkArg = testCase.first[i];
+            shrunkArg.resize(::strlen(shrunkArg.c_str()));
+            ASSERT_EQ(shrunkArg, testCase.second[i]);
         }
     }
-
-} // namespace
+}
+}  // namespace
+}  // namespace mongo

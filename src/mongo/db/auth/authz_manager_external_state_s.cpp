@@ -1,406 +1,158 @@
 /**
-*    Copyright (C) 2012 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
-#include "mongo/db/auth/authz_manager_external_state_s.h"
-
-#include <boost/thread/mutex.hpp>
-#include <boost/scoped_ptr.hpp>
+#include <absl/container/node_hash_set.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+#include <cstddef>
+#include <set>
 #include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/client/dbclientinterface.h"
-#include "mongo/client/distlock.h"
-#include "mongo/db/auth/authorization_manager.h"
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/shim.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/auth/auth_name.h"
+#include "mongo/db/auth/authorization_client_handle.h"
+#include "mongo/db/auth/authz_manager_external_state_s.h"
+#include "mongo/db/auth/authz_session_external_state.h"
+#include "mongo/db/auth/authz_session_external_state_router.h"
+#include "mongo/db/auth/user_document_parser.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/s/config.h"
-#include "mongo/s/type_database.h"
+#include "mongo/db/commands/user_management_commands_gen.h"
+#include "mongo/db/multitenancy.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/grid.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-    AuthzManagerExternalStateMongos::AuthzManagerExternalStateMongos() {}
+namespace {
 
-    AuthzManagerExternalStateMongos::~AuthzManagerExternalStateMongos() {}
+/**
+ * Returns the top level field which is expected to be returned by rolesInfo.
+ */
+std::string rolesFieldName(PrivilegeFormat showPrivileges) {
+    if (showPrivileges == PrivilegeFormat::kShowAsUserFragment) {
+        return "userFragment";
+    }
+    return "roles";
+}
 
-    Status AuthzManagerExternalStateMongos::initialize() {
-        return Status::OK();
+/**
+ * Attches a string representation of a PrivilegeFormat to the provided BSONObjBuilder.
+ */
+void addShowToBuilder(BSONObjBuilder* builder,
+                      PrivilegeFormat showPrivileges,
+                      AuthenticationRestrictionsFormat showRestrictions) {
+    if (showPrivileges == PrivilegeFormat::kShowAsUserFragment) {
+        builder->append("showPrivileges", "asUserfragment");
+    } else {
+        builder->append("showPrivileges", showPrivileges == PrivilegeFormat::kShowSeparate);
+        builder->append("showAuthenticationRestrictions",
+                        showRestrictions == AuthenticationRestrictionsFormat::kShow);
+    }
+}
+
+}  // namespace
+
+AuthzManagerExternalStateMongos::AuthzManagerExternalStateMongos() = default;
+
+AuthzManagerExternalStateMongos::~AuthzManagerExternalStateMongos() = default;
+
+std::unique_ptr<AuthzSessionExternalState>
+AuthzManagerExternalStateMongos::makeAuthzSessionExternalState(Client* client) {
+    return std::make_unique<AuthzSessionExternalStateRouter>(client);
+}
+
+StatusWith<User> AuthzManagerExternalStateMongos::getUserObject(
+    OperationContext* opCtx,
+    const UserRequest& userReq,
+    const SharedUserAcquisitionStats& userAcquisitionStats) {
+    // Marshalling to BSON and back is inevitable since the
+    // source of truth is a system external to mongos.
+    BSONObj userDoc;
+    auto status = getUserDescription(opCtx, userReq, &userDoc, userAcquisitionStats);
+    if (!status.isOK()) {
+        return status;
     }
 
-    namespace {
-        ScopedDbConnection* getConnectionForAuthzCollection(const NamespaceString& ns) {
-            //
-            // Note: The connection mechanism here is *not* ideal, and should not be used elsewhere.
-            // If the primary for the collection moves, this approach may throw rather than handle
-            // version exceptions.
-            //
-
-            DBConfigPtr config = grid.getDBConfig(ns.ns());
-            Shard s = config->getShard(ns.ns());
-
-            return new ScopedDbConnection(s.getConnString(), 30.0);
-        }
+    User user(userReq.clone());
+    V2UserDocumentParser dp;
+    dp.setTenantId(getActiveTenant(opCtx));
+    status = dp.initializeUserFromUserDocument(userDoc, &user);
+    if (!status.isOK()) {
+        return status;
     }
 
-    Status AuthzManagerExternalStateMongos::getStoredAuthorizationVersion(int* outVersion) {
-        try {
-            scoped_ptr<ScopedDbConnection> conn(getConnectionForAuthzCollection(
-                    AuthorizationManager::usersCollectionNamespace));
-            BSONObj cmdResult;
-            conn->get()->runCommand(
-                    "admin",
-                    BSON("getParameter" << 1 <<
-                         AuthorizationManager::schemaVersionServerParameter << 1),
-                    cmdResult);
-            if (!cmdResult["ok"].trueValue()) {
-                std::string errmsg = cmdResult["errmsg"].str();
-                if (errmsg == "no option found to get" ||
-                    StringData(errmsg).startsWith("no such cmd")) {
+    return std::move(user);
+}
 
-                    *outVersion = 1;
-                    conn->done();
-                    return Status::OK();
-                }
-                int code = cmdResult["code"].numberInt();
-                if (code == 0) {
-                    code = ErrorCodes::UnknownError;
-                }
-                return Status(ErrorCodes::Error(code), errmsg);
-            }
-            BSONElement versionElement =
-                cmdResult[AuthorizationManager::schemaVersionServerParameter];
-            if (versionElement.eoo())
-                return Status(ErrorCodes::UnknownError, "getParameter misbehaved.");
-            *outVersion = versionElement.numberInt();
-            conn->done();
-            return Status::OK();
-        } catch (const DBException& e) {
-            return e.toStatus();
-        }
-    }
+Status AuthzManagerExternalStateMongos::getUserDescription(
+    OperationContext* opCtx,
+    const UserRequest& userReq,
+    BSONObj* result,
+    const SharedUserAcquisitionStats& userAcquisitionStats) {
+    return AuthorizationManager::get(opCtx->getService())
+        ->lookupUserDescription(opCtx, userReq.getUserName(), result);
+}
 
-    Status AuthzManagerExternalStateMongos::getUserDescription(const UserName& userName,
-                                                               BSONObj* result) {
-        try {
-            scoped_ptr<ScopedDbConnection> conn(getConnectionForAuthzCollection(
-                    AuthorizationManager::usersCollectionNamespace));
-            BSONObj cmdResult;
-            conn->get()->runCommand(
-                    "admin",
-                    BSON("usersInfo" <<
-                         BSON_ARRAY(BSON(AuthorizationManager::USER_NAME_FIELD_NAME <<
-                                         userName.getUser() <<
-                                         AuthorizationManager::USER_DB_FIELD_NAME <<
-                                         userName.getDB())) <<
-                         "showPrivileges" << true <<
-                         "showCredentials" << true),
-                    cmdResult);
-            if (!cmdResult["ok"].trueValue()) {
-                int code = cmdResult["code"].numberInt();
-                if (code == 0) code = ErrorCodes::UnknownError;
-                return Status(ErrorCodes::Error(code), cmdResult["errmsg"].str());
-            }
+Status AuthzManagerExternalStateMongos::rolesExist(OperationContext* opCtx,
+                                                   const std::vector<RoleName>& roleNames) try {
+    return AuthorizationManager::get(opCtx->getService())->rolesExist(opCtx, roleNames);
+} catch (const DBException& ex) {
+    return ex.toStatus();
+}
 
-            std::vector<BSONElement> foundUsers = cmdResult["users"].Array();
-            if (foundUsers.size() == 0) {
-                return Status(ErrorCodes::UserNotFound, "User not found");
-            }
-            if (foundUsers.size() > 1) {
-                return Status(ErrorCodes::UserDataInconsistent,
-                              mongoutils::str::stream() << "Found multiple users on the \"" <<
-                                      userName.getDB() << "\" database with name \"" <<
-                                      userName.getUser() << "\"");
-            }
-            *result = foundUsers[0].Obj().getOwned();
-            conn->done();
-            return Status::OK();
-        } catch (const DBException& e) {
-            return e.toStatus();
-        }
-    }
+bool AuthzManagerExternalStateMongos::hasAnyPrivilegeDocuments(OperationContext* opCtx) {
+    return AuthorizationManager::get(opCtx->getService())->hasAnyPrivilegeDocuments(opCtx);
+}
 
-    Status AuthzManagerExternalStateMongos::getRoleDescription(const RoleName& roleName,
-                                                               BSONObj* result) {
-        try {
-            scoped_ptr<ScopedDbConnection> conn(getConnectionForAuthzCollection(
-                    AuthorizationManager::rolesCollectionNamespace));
-            BSONObj cmdResult;
-            conn->get()->runCommand(
-                    "admin",
-                    BSON("rolesInfo" <<
-                         BSON_ARRAY(BSON(AuthorizationManager::ROLE_NAME_FIELD_NAME <<
-                                         roleName.getRole() <<
-                                         AuthorizationManager::ROLE_SOURCE_FIELD_NAME <<
-                                         roleName.getDB()))),
-                    cmdResult);
-            if (!cmdResult["ok"].trueValue()) {
-                int code = cmdResult["code"].numberInt();
-                if (code == 0) code = ErrorCodes::UnknownError;
-                return Status(ErrorCodes::Error(code), cmdResult["errmsg"].str());
-            }
-            *result = cmdResult["roles"]["0"].Obj().getOwned();
-            conn->done();
-            return Status::OK();
-        } catch (const DBException& e) {
-            return e.toStatus();
-        }
-    }
+namespace {
 
-    Status AuthzManagerExternalStateMongos::findOne(
-            const NamespaceString& collectionName,
-            const BSONObj& query,
-            BSONObj* result) {
-        try {
-            scoped_ptr<ScopedDbConnection> conn(getConnectionForAuthzCollection(collectionName));
-            *result = conn->get()->findOne(collectionName, query).getOwned();
-            conn->done();
-            if (result->isEmpty()) {
-                return Status(ErrorCodes::NoMatchingDocument, mongoutils::str::stream() <<
-                              "No document in " << collectionName.ns() << " matches " << query);
-            }
-            return Status::OK();
-        } catch (const DBException& e) {
-            return e.toStatus();
-        }
-    }
+std::unique_ptr<AuthzManagerExternalState> authzManagerExternalStateCreateImpl() {
+    return std::make_unique<AuthzManagerExternalStateMongos>();
+}
 
-    Status AuthzManagerExternalStateMongos::query(
-            const NamespaceString& collectionName,
-            const BSONObj& query,
-            const BSONObj& projection,
-            const boost::function<void(const BSONObj&)>& resultProcessor) {
-        try {
-            scoped_ptr<ScopedDbConnection> conn(getConnectionForAuthzCollection(collectionName));
-            conn->get()->query(resultProcessor, collectionName.ns(), query, &projection);
-            return Status::OK();
-        } catch (const DBException& e) {
-            return e.toStatus();
-        }
-    }
+auto authzManagerExternalStateCreateRegistration = MONGO_WEAK_FUNCTION_REGISTRATION(
+    AuthzManagerExternalState::create, authzManagerExternalStateCreateImpl);
 
-    Status AuthzManagerExternalStateMongos::getAllDatabaseNames(
-            std::vector<std::string>* dbnames) {
-        try {
-            scoped_ptr<ScopedDbConnection> conn(
-                    getConnectionForAuthzCollection(NamespaceString(DatabaseType::ConfigNS)));
-            auto_ptr<DBClientCursor> c = conn->get()->query(DatabaseType::ConfigNS, Query());
+}  // namespace
 
-            while (c->more()) {
-                DatabaseType dbInfo;
-                std::string errmsg;
-                if (!dbInfo.parseBSON( c->nextSafe(), &errmsg) || !dbInfo.isValid( &errmsg )) {
-                    return Status(ErrorCodes::FailedToParse, errmsg);
-                }
-                dbnames->push_back(dbInfo.getName());
-            }
-            conn->done();
-            dbnames->push_back("config"); // config db isn't listed in config.databases
-            return Status::OK();
-        } catch (const DBException& e) {
-            return e.toStatus();
-        }
-    }
-
-    Status AuthzManagerExternalStateMongos::insert(
-            const NamespaceString& collectionName,
-            const BSONObj& document,
-            const BSONObj& writeConcern) {
-        try {
-            scoped_ptr<ScopedDbConnection> conn(getConnectionForAuthzCollection(collectionName));
-
-            conn->get()->insert(collectionName, document);
-
-            // Handle write concern
-            BSONObjBuilder gleBuilder;
-            gleBuilder.append("getLastError", 1);
-            gleBuilder.appendElements(writeConcern);
-            BSONObj res;
-            conn->get()->runCommand("admin", gleBuilder.done(), res);
-            string errstr = conn->get()->getLastErrorString(res);
-            conn->done();
-
-            if (errstr.empty()) {
-                return Status::OK();
-            }
-            if (res.hasField("code") && res["code"].Int() == ASSERT_ID_DUPKEY) {
-                return Status(ErrorCodes::DuplicateKey, errstr);
-            }
-            return Status(ErrorCodes::UnknownError, errstr);
-        } catch (const DBException& e) {
-            return e.toStatus();
-        }
-    }
-
-    Status AuthzManagerExternalStateMongos::update(const NamespaceString& collectionName,
-                                                   const BSONObj& query,
-                                                   const BSONObj& updatePattern,
-                                                   bool upsert,
-                                                   bool multi,
-                                                   const BSONObj& writeConcern,
-                                                   int* numUpdated) {
-        try {
-            scoped_ptr<ScopedDbConnection> conn(getConnectionForAuthzCollection(collectionName));
-
-            conn->get()->update(collectionName, query, updatePattern, upsert, multi);
-
-            // Handle write concern
-            BSONObjBuilder gleBuilder;
-            gleBuilder.append("getLastError", 1);
-            gleBuilder.appendElements(writeConcern);
-            BSONObj res;
-            conn->get()->runCommand("admin", gleBuilder.done(), res);
-            string err = conn->get()->getLastErrorString(res);
-            conn->done();
-
-            if (!err.empty()) {
-                return Status(ErrorCodes::UnknownError, err);
-            }
-
-            *numUpdated = res["n"].numberInt();
-            return Status::OK();
-        } catch (const DBException& e) {
-            return e.toStatus();
-        }
-    }
-
-    Status AuthzManagerExternalStateMongos::remove(
-            const NamespaceString& collectionName,
-            const BSONObj& query,
-            const BSONObj& writeConcern,
-            int* numRemoved) {
-        try {
-            scoped_ptr<ScopedDbConnection> conn(getConnectionForAuthzCollection(collectionName));
-
-            conn->get()->remove(collectionName, query);
-
-            // Handle write concern
-            BSONObjBuilder gleBuilder;
-            gleBuilder.append("getLastError", 1);
-            gleBuilder.appendElements(writeConcern);
-            BSONObj res;
-            conn->get()->runCommand("admin", gleBuilder.done(), res);
-            string err = conn->get()->getLastErrorString(res);
-            conn->done();
-
-            if (!err.empty()) {
-                return Status(ErrorCodes::UnknownError, err);
-            }
-
-            *numRemoved = res["n"].numberInt();
-            return Status::OK();
-        } catch (const DBException& e) {
-            return e.toStatus();
-        }
-    }
-
-    Status AuthzManagerExternalStateMongos::createIndex(
-            const NamespaceString& collectionName,
-            const BSONObj& pattern,
-            bool unique,
-            const BSONObj& writeConcern) {
-        try {
-            scoped_ptr<ScopedDbConnection> conn(getConnectionForAuthzCollection(collectionName));
-
-            if (conn->get()->ensureIndex(collectionName.ns(), pattern, unique)) {
-
-                // Handle write concern
-                BSONObjBuilder gleBuilder;
-                gleBuilder.append("getLastError", 1);
-                gleBuilder.appendElements(writeConcern);
-                BSONObj res;
-                conn->get()->runCommand("admin", gleBuilder.done(), res);
-                string err = conn->get()->getLastErrorString(res);
-
-                if (!err.empty()) {
-                    conn->done();
-                    return Status(ErrorCodes::UnknownError, err);
-                }
-            }
-            conn->done();
-            return Status::OK();
-
-        } catch (const DBException& ex) {
-            return ex.toStatus();
-        }
-    }
-
-    Status AuthzManagerExternalStateMongos::dropIndexes(
-            const NamespaceString& collectionName,
-            const BSONObj& writeConcern) {
-
-        scoped_ptr<ScopedDbConnection> conn(getConnectionForAuthzCollection(collectionName));
-        try {
-            conn->get()->dropIndexes(collectionName.ns());
-            BSONObjBuilder gleBuilder;
-            gleBuilder.append("getLastError", 1);
-            gleBuilder.appendElements(writeConcern);
-            BSONObj res;
-            conn->get()->runCommand("admin", gleBuilder.done(), res);
-            string errstr = conn->get()->getLastErrorString(res);
-            if (!errstr.empty()) {
-                conn->done();
-                return Status(ErrorCodes::UnknownError, errstr);
-            }
-            conn->done();
-            return Status::OK();
-        }
-        catch (const DBException& ex) {
-            return ex.toStatus();
-        }
-    }
-
-    bool AuthzManagerExternalStateMongos::tryAcquireAuthzUpdateLock(const StringData& why) {
-        boost::lock_guard<boost::mutex> lkLocal(_distLockGuard);
-        if (_authzDataUpdateLock.get()) {
-            return false;
-        }
-
-        // Temporarily put into an auto_ptr just in case there is an exception thrown during
-        // lock acquisition.
-        std::auto_ptr<ScopedDistributedLock> lockHolder(new ScopedDistributedLock(
-                configServer.getConnectionString(), "authorizationData"));
-        lockHolder->setLockMessage(why.toString());
-
-        std::string errmsg;
-        if (!lockHolder->acquire(_authzUpdateLockAcquisitionTimeoutMillis, &errmsg)) {
-            warning() <<
-                    "Error while attempting to acquire distributed lock for user modification: " <<
-                    errmsg << endl;
-            return false;
-        }
-        _authzDataUpdateLock.reset(lockHolder.release());
-        return true;
-    }
-
-    void AuthzManagerExternalStateMongos::releaseAuthzUpdateLock() {
-        boost::lock_guard<boost::mutex> lkLocal(_distLockGuard);
-        _authzDataUpdateLock.reset();
-    }
-
-} // namespace mongo
+}  // namespace mongo

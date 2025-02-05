@@ -1,4 +1,4 @@
-// $Id: tss_pe.cpp 72431 2011-06-06 08:28:31Z anthonyw $
+// $Id$
 // (C) Copyright Aaron W. LaFramboise, Roland Schwarz, Michael Glassford 2004.
 // (C) Copyright 2007 Roland Schwarz
 // (C) Copyright 2007 Anthony Williams
@@ -7,11 +7,12 @@
 // Boost Software License, Version 1.0. (See accompanying file
 // LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
+#include <boost/winapi/config.hpp>
 #include <boost/thread/detail/config.hpp>
 
-#if defined(BOOST_HAS_WINTHREADS) && defined(BOOST_THREAD_BUILD_LIB) 
+#if defined(BOOST_THREAD_WIN32) && defined(BOOST_THREAD_BUILD_LIB)
 
-#if (defined(__MINGW32__) && !defined(_WIN64)) || defined(__MINGW64__)
+#if (defined(__MINGW32__) && !defined(_WIN64)) || defined(__MINGW64__) || (__MINGW64_VERSION_MAJOR)
 
 #include <boost/thread/detail/tss_hooks.hpp>
 
@@ -25,7 +26,7 @@ namespace boost
 }
 
 namespace {
-    void NTAPI on_tls_callback(void* h, DWORD dwReason, PVOID pv)
+    void NTAPI on_tls_callback(void* , DWORD dwReason, PVOID )
     {
         switch (dwReason)
         {
@@ -38,7 +39,7 @@ namespace {
     }
 }
 
-#if defined(__MINGW64__) || (__MINGW32_MAJOR_VERSION >3) ||             \
+#if defined(__MINGW64__) || (__MINGW64_VERSION_MAJOR) || (__MINGW32__) || (__MINGW32_MAJOR_VERSION >3) ||   \
     ((__MINGW32_MAJOR_VERSION==3) && (__MINGW32_MINOR_VERSION>=18))
 extern "C"
 {
@@ -77,19 +78,60 @@ extern "C" const IMAGE_TLS_DIRECTORY32 _tls_used __attribute__ ((section(".rdata
 
     #include <stdlib.h>
 
-    #define WIN32_LEAN_AND_MEAN
     #include <windows.h>
 
-    //Definitions required by implementation
 
-    #if (_MSC_VER < 1300) // 1300 == VC++ 7.0
-        typedef void (__cdecl *_PVFV)();
-        #define INIRETSUCCESS
-        #define PVAPI void __cdecl
+// _pRawDllMainOrig can be defined by including boost/thread/win32/mfc_thread_init.hpp
+// into your dll; it ensures that MFC-Dll-initialization will be done properly
+// The following code is adapted from the MFC-Dll-init code
+/*
+ * _pRawDllMainOrig MUST be an extern const variable, which will be aliased to
+ * _pDefaultRawDllMainOrig if no real user definition is present, thanks to the
+ * alternatename directive.
+ */
+
+// work at least with _MSC_VER 1500 (MSVC++ 9.0, VS 2008)
+#if (_MSC_VER >= 1500)
+
+extern "C" {
+extern BOOL (WINAPI * const _pRawDllMainOrig)(HINSTANCE, DWORD, LPVOID);
+extern BOOL (WINAPI * const _pDefaultRawDllMainOrig)(HINSTANCE, DWORD, LPVOID) = NULL;
+#if defined (_M_IX86)
+#pragma comment(linker, "/alternatename:__pRawDllMainOrig=__pDefaultRawDllMainOrig")
+#elif defined (_M_X64) || defined (_M_ARM) || defined (_M_ARM64)
+#pragma comment(linker, "/alternatename:_pRawDllMainOrig=_pDefaultRawDllMainOrig")
+#else  /* unknown Windows target (not x86, x64, ARM, ARM64) */
+#error Unsupported platform
+#endif  /* defined (_M_X64) || defined (_M_ARM) || defined (_M_ARM64) */
+}
+
+#endif
+
+
+
+
+    //Definitions required by implementation
+    #if (_MSC_VER < 1300) || ((_MSC_VER > 1900) && (_MSC_VER < 1910)) // 1300 == VC++ 7.0, 1900 == VC++ 14.0, 1910 == VC++ 2017
+        typedef void ( __cdecl *_PVFV_ )();
+        typedef void ( __cdecl *_PIFV_ )();
+        #define INIRETSUCCESS_V
+        #define INIRETSUCCESS_I
+        #define PVAPI_V void __cdecl
+        #define PVAPI_I void __cdecl
+    #elif (_MSC_VER >= 1910)
+        typedef void ( __cdecl *_PVFV_ )();
+        typedef int ( __cdecl *_PIFV_ )();
+        #define INIRETSUCCESS_V
+        #define INIRETSUCCESS_I 0
+        #define PVAPI_V void __cdecl
+        #define PVAPI_I int __cdecl
     #else
-        typedef int (__cdecl *_PVFV)();
-        #define INIRETSUCCESS 0
-        #define PVAPI int __cdecl
+        typedef int ( __cdecl *_PVFV_ )();
+        typedef int ( __cdecl *_PIFV_ )();
+        #define INIRETSUCCESS_V 0
+        #define INIRETSUCCESS_I 0
+        #define PVAPI_V int __cdecl
+        #define PVAPI_I int __cdecl
     #endif
 
     typedef void (NTAPI* _TLSCB)(HINSTANCE, DWORD, PVOID);
@@ -106,23 +148,29 @@ extern "C" const IMAGE_TLS_DIRECTORY32 _tls_used __attribute__ ((section(".rdata
     {
         //Forward declarations
 
-        static PVAPI on_tls_prepare();
-        static PVAPI on_process_init();
-        static PVAPI on_process_term();
+        static PVAPI_I on_tls_prepare();
+        static PVAPI_V on_process_init();
+        static PVAPI_V on_process_term();
         static void NTAPI on_tls_callback(HINSTANCE, DWORD, PVOID);
+    }
 
+    namespace boost
+    {
         //The .CRT$Xxx information is taken from Codeguru:
         //http://www.codeguru.com/Cpp/misc/misc/threadsprocesses/article.php/c6945__2/
+
+        // Variables below are not referenced anywhere and
+        // to not be optimized away has to have external linkage
 
 #if (_MSC_VER >= 1400)
 #pragma section(".CRT$XIU",long,read)
 #pragma section(".CRT$XCU",long,read)
 #pragma section(".CRT$XTU",long,read)
 #pragma section(".CRT$XLC",long,read)
-        __declspec(allocate(".CRT$XLC")) _TLSCB __xl_ca=on_tls_callback;
-        __declspec(allocate(".CRT$XIU"))_PVFV p_tls_prepare = on_tls_prepare;
-        __declspec(allocate(".CRT$XCU"))_PVFV p_process_init = on_process_init;
-        __declspec(allocate(".CRT$XTU"))_PVFV p_process_term = on_process_term;
+        extern const __declspec(allocate(".CRT$XLC")) _TLSCB p_tls_callback = on_tls_callback;
+        extern const __declspec(allocate(".CRT$XIU")) _PIFV_ p_tls_prepare = on_tls_prepare;
+        extern const __declspec(allocate(".CRT$XCU")) _PVFV_ p_process_init = on_process_init;
+        extern const __declspec(allocate(".CRT$XTU")) _PVFV_ p_process_term = on_process_term;
 #else
         #if (_MSC_VER >= 1300) // 1300 == VC++ 7.0
         #   pragma data_seg(push, old_seg)
@@ -134,36 +182,39 @@ extern "C" const IMAGE_TLS_DIRECTORY32 _tls_used __attribute__ ((section(".rdata
             //this could be changed easily if required.
 
             #pragma data_seg(".CRT$XIU")
-            static _PVFV p_tls_prepare = on_tls_prepare;
+            extern const _PIFV_ p_tls_prepare = on_tls_prepare;
             #pragma data_seg()
 
             //Callback after all global ctors.
 
             #pragma data_seg(".CRT$XCU")
-            static _PVFV p_process_init = on_process_init;
+            extern const _PVFV_ p_process_init = on_process_init;
             #pragma data_seg()
 
             //Callback for tls notifications.
 
             #pragma data_seg(".CRT$XLB")
-            _TLSCB p_thread_callback = on_tls_callback;
+            extern const _TLSCB p_thread_callback = on_tls_callback;
             #pragma data_seg()
             //Callback for termination.
 
             #pragma data_seg(".CRT$XTU")
-            static _PVFV p_process_term = on_process_term;
+            extern const _PVFV_ p_process_term = on_process_term;
             #pragma data_seg()
         #if (_MSC_VER >= 1300) // 1300 == VC++ 7.0
         #   pragma data_seg(pop, old_seg)
         #endif
 #endif
+    } // namespace boost
 
+    namespace
+    {
 #ifdef BOOST_MSVC
 #pragma warning(push)
 #pragma warning(disable:4189)
 #endif
 
-        PVAPI on_tls_prepare()
+        PVAPI_I on_tls_prepare()
         {
             //The following line has an important side effect:
             //if the TLS directory is not already there, it will
@@ -198,13 +249,13 @@ extern "C" const IMAGE_TLS_DIRECTORY32 _tls_used __attribute__ ((section(".rdata
                 *pfdst = 0;
             #endif
 
-            return INIRETSUCCESS;
+            return INIRETSUCCESS_I;
         }
 #ifdef BOOST_MSVC
 #pragma warning(pop)
 #endif
 
-        PVAPI on_process_init()
+        PVAPI_V on_process_init()
         {
             //Schedule on_thread_exit() to be called for the main
             //thread before destructors of global objects have been
@@ -221,13 +272,13 @@ extern "C" const IMAGE_TLS_DIRECTORY32 _tls_used __attribute__ ((section(".rdata
 
             boost::on_process_enter();
 
-            return INIRETSUCCESS;
+            return INIRETSUCCESS_V;
         }
 
-        PVAPI on_process_term()
+        PVAPI_V on_process_term()
         {
             boost::on_process_exit();
-            return INIRETSUCCESS;
+            return INIRETSUCCESS_V;
         }
 
         void NTAPI on_tls_callback(HINSTANCE /*h*/, DWORD dwReason, PVOID /*pv*/)
@@ -240,7 +291,11 @@ extern "C" const IMAGE_TLS_DIRECTORY32 _tls_used __attribute__ ((section(".rdata
             }
         }
 
-        BOOL WINAPI dll_callback(HANDLE, DWORD dwReason, LPVOID)
+#if (_MSC_VER >= 1500)
+        BOOL WINAPI dll_callback(HINSTANCE hInstance, DWORD dwReason, LPVOID lpReserved)
+#else
+        BOOL WINAPI dll_callback(HINSTANCE, DWORD dwReason, LPVOID)
+#endif
         {
             switch (dwReason)
             {
@@ -251,13 +306,20 @@ extern "C" const IMAGE_TLS_DIRECTORY32 _tls_used __attribute__ ((section(".rdata
                 boost::on_process_exit();
                 break;
             }
+
+#if (_MSC_VER >= 1500)
+            if( _pRawDllMainOrig )
+            {
+                return _pRawDllMainOrig(hInstance, dwReason, lpReserved);
+            }
+#endif
             return true;
         }
     } //namespace
 
 extern "C"
 {
-    extern BOOL (WINAPI * const _pRawDllMain)(HANDLE, DWORD, LPVOID)=&dll_callback;
+    extern BOOL (WINAPI * const _pRawDllMain)(HINSTANCE, DWORD, LPVOID)=&dll_callback;
 }
 namespace boost
 {
@@ -281,4 +343,4 @@ namespace boost
 
 #endif //defined(_MSC_VER) && !defined(UNDER_CE)
 
-#endif //defined(BOOST_HAS_WINTHREADS) && defined(BOOST_THREAD_BUILD_LIB)
+#endif //defined(BOOST_THREAD_WIN32) && defined(BOOST_THREAD_BUILD_LIB)

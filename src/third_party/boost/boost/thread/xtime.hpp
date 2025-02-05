@@ -2,13 +2,14 @@
 // William E. Kempf
 // Copyright (C) 2007-8 Anthony Williams
 //
-//  Distributed under the Boost Software License, Version 1.0. (See accompanying 
+//  Distributed under the Boost Software License, Version 1.0. (See accompanying
 //  file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 
 #ifndef BOOST_XTIME_WEK070601_HPP
 #define BOOST_XTIME_WEK070601_HPP
 
 #include <boost/thread/detail/config.hpp>
+#if defined BOOST_THREAD_USES_DATETIME
 
 #include <boost/cstdint.hpp>
 #include <boost/thread/thread_time.hpp>
@@ -16,14 +17,11 @@
 
 #include <boost/config/abi_prefix.hpp>
 
-#define MONGO_BOOST_TIME_UTC_HACK 1
-
 namespace boost {
 
 enum xtime_clock_types
 {
-    //TIME_UTC=1
-    TIME_UTC_=1 // 10gen: switched to TIME_UTC_ as in boost 1.50 to avoid C11 / glibc-2.16 conflict
+    TIME_UTC_=1
 //    TIME_TAI,
 //    TIME_MONOTONIC,
 //    TIME_PROCESS,
@@ -56,20 +54,20 @@ struct xtime
         boost::posix_time::microseconds((nsec+500)/1000);
 #endif
     }
-    
+
 };
 
-inline xtime get_xtime(boost::system_time const& abs_time)
+inline ::boost::xtime get_xtime(boost::system_time const& abs_time)
 {
-    xtime res;
+    ::boost::xtime res;
     boost::posix_time::time_duration const time_since_epoch=abs_time-boost::posix_time::from_time_t(0);
-            
-    res.sec=static_cast<xtime::xtime_sec_t>(time_since_epoch.total_seconds());
-    res.nsec=static_cast<xtime::xtime_nsec_t>(time_since_epoch.fractional_seconds()*(1000000000/time_since_epoch.ticks_per_second()));
+
+    res.sec=static_cast< ::boost::xtime::xtime_sec_t>(time_since_epoch.total_seconds());
+    res.nsec=static_cast< ::boost::xtime::xtime_nsec_t>(time_since_epoch.fractional_seconds()*(1000000000/time_since_epoch.ticks_per_second()));
     return res;
 }
 
-inline int xtime_get(struct xtime* xtp, int clock_type)
+inline int xtime_get(struct ::boost::xtime* xtp, int clock_type)
 {
     if (clock_type == TIME_UTC_)
     {
@@ -80,16 +78,16 @@ inline int xtime_get(struct xtime* xtp, int clock_type)
 }
 
 
-inline int xtime_cmp(const xtime& xt1, const xtime& xt2)
+inline int xtime_cmp(const ::boost::xtime& xt1, const ::boost::xtime& xt2)
 {
     if (xt1.sec == xt2.sec)
         return (int)(xt1.nsec - xt2.nsec);
-    else 
+    else
         return (xt1.sec > xt2.sec) ? 1 : -1;
 }
 
 } // namespace boost
 
 #include <boost/config/abi_suffix.hpp>
-
+#endif
 #endif //BOOST_XTIME_WEK070601_HPP

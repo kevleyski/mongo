@@ -1,100 +1,117 @@
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#include "mongo/pch.h"
+#include <limits>
 
-#include "mongo/db/jsobj.h"
 #include "mongo/s/chunk_version.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
 
-    /**
-     * Tests parsing of BSON for versions.  In version 2.2, this parsing is meant to be very
-     * flexible so different formats can be tried and enforced later.
-     *
-     * Formats are:
-     *
-     * A) { vFieldName : <TSTYPE>, [ vFieldNameEpoch : <OID> ], ... }
-     * B) { fieldName : [ <TSTYPE>, <OID> ], ... }
-     *
-     * vFieldName is a specifyable name - usually "version" (default) or "lastmod".  <TSTYPE> is a
-     * type convertible to Timestamp, ideally Timestamp but also numeric.
-     * <OID> is a value of type OID.
-     *
-     */
+TEST(ChunkVersionTest, EqualityOperators) {
+    OID epoch = OID::gen();
+    Timestamp timestamp = Timestamp(1);
 
-    TEST(Compatibility, LegacyFormatA) {
-        BSONObjBuilder versionObjB;
-        versionObjB.appendTimestamp( "testVersion",
-                                     ChunkVersion( 1, 1, OID() ).toLong() );
-        versionObjB.append( "testVersionEpoch", OID::gen() );
-        BSONObj versionObj = versionObjB.obj();
+    ASSERT_EQ(ChunkVersion({epoch, Timestamp(1, 1)}, {3, 1}),
+              ChunkVersion({epoch, Timestamp(1, 1)}, {3, 1}));
+    ASSERT_EQ(ChunkVersion({OID(), timestamp}, {3, 1}), ChunkVersion({OID(), timestamp}, {3, 1}));
 
-        ChunkVersion parsed =
-            ChunkVersion::fromBSON( versionObj[ "testVersion" ] );
+    ASSERT_NE(ChunkVersion({epoch, timestamp}, {3, 1}),
+              ChunkVersion({OID(), Timestamp(1, 1)}, {3, 1}));
+    ASSERT_NE(ChunkVersion({OID(), Timestamp(1, 1)}, {3, 1}),
+              ChunkVersion({epoch, timestamp}, {3, 1}));
+    ASSERT_NE(ChunkVersion({epoch, timestamp}, {4, 2}), ChunkVersion({epoch, timestamp}, {4, 1}));
+}
 
-        ASSERT( ChunkVersion::canParseBSON( versionObj[ "testVersion" ] ) );
-        ASSERT( parsed.majorVersion() == 1 );
-        ASSERT( parsed.minorVersion() == 1 );
-        ASSERT( ! parsed.epoch().isSet() );
+TEST(ChunkVersionTest, OlderThan) {
+    OID epoch = OID::gen();
+    Timestamp timestamp(1);
+    Timestamp newerTimestamp(2);
 
-        parsed = ChunkVersion::fromBSON( versionObj, "testVersion" );
+    ASSERT(ChunkVersion({epoch, timestamp}, {3, 1})
+               .isOlderThan(ChunkVersion({epoch, timestamp}, {4, 1})));
+    ASSERT(!ChunkVersion({epoch, timestamp}, {4, 1})
+                .isOlderThan(ChunkVersion({epoch, timestamp}, {3, 1})));
 
-        ASSERT( ChunkVersion::canParseBSON( versionObj, "testVersion" ) );
-        ASSERT( parsed.majorVersion() == 1 );
-        ASSERT( parsed.minorVersion() == 1 );
-        ASSERT( parsed.epoch().isSet() );
-    }
+    ASSERT(ChunkVersion({epoch, timestamp}, {3, 1})
+               .isOlderThan(ChunkVersion({epoch, timestamp}, {3, 2})));
+    ASSERT(!ChunkVersion({epoch, timestamp}, {3, 2})
+                .isOlderThan(ChunkVersion({epoch, timestamp}, {3, 1})));
 
-    TEST(Compatibility, SubArrayFormatB) {
-        BSONObjBuilder tsObjB;
-        tsObjB.appendTimestamp( "ts", ChunkVersion( 1, 1, OID() ).toLong() );
-        BSONObj tsObj = tsObjB.obj();
+    ASSERT(ChunkVersion({epoch, timestamp}, {3, 1})
+               .isOlderThan(ChunkVersion({OID::gen(), newerTimestamp}, {3, 1})));
+    ASSERT(!ChunkVersion({epoch, newerTimestamp}, {3, 1})
+                .isOlderThan(ChunkVersion({OID::gen(), timestamp}, {3, 1})));
 
-        BSONObjBuilder versionObjB;
-        BSONArrayBuilder subArrB( versionObjB.subarrayStart( "testVersion" ) );
-        // Append this weird way so we're sure we get a timestamp type
-        subArrB.append( tsObj.firstElement() );
-        subArrB.append( OID::gen() );
-        subArrB.done();
-        BSONObj versionObj = versionObjB.obj();
+    ASSERT(!ChunkVersion::UNSHARDED().isOlderThan(ChunkVersion({epoch, timestamp}, {3, 1})));
+    ASSERT(!ChunkVersion({epoch, timestamp}, {3, 1}).isOlderThan(ChunkVersion::UNSHARDED()));
+}
 
-        ChunkVersion parsed =
-            ChunkVersion::fromBSON( versionObj[ "testVersion" ] );
+TEST(ChunkVersionTest, CreateWithLargeValues) {
+    const uint32_t majorVersion = std::numeric_limits<uint32_t>::max();
+    const uint32_t minorVersion = std::numeric_limits<uint32_t>::max();
+    const auto epoch = OID::gen();
 
-        ASSERT( ChunkVersion::canParseBSON( versionObj[ "testVersion" ] ) );
-        ASSERT( ChunkVersion::canParseBSON( BSONArray( versionObj[ "testVersion" ].Obj() ) ) );
-        ASSERT( parsed.majorVersion() == 1 );
-        ASSERT( parsed.minorVersion() == 1 );
-        ASSERT( parsed.epoch().isSet() );
-    }
+    ChunkVersion version({epoch, Timestamp(1, 1)}, {majorVersion, minorVersion});
+    ASSERT_EQ(majorVersion, version.majorVersion());
+    ASSERT_EQ(minorVersion, version.minorVersion());
+    ASSERT_EQ(epoch, version.epoch());
+    ASSERT_EQ(Timestamp(1, 1), version.getTimestamp());
+}
 
-} // unnamed namespace
-} // namespace mongo
+TEST(ChunkVersionTest, ThrowsErrorIfOverflowIsAttemptedForMajorVersion) {
+    const uint32_t majorVersion = std::numeric_limits<uint32_t>::max();
+    const uint32_t minorVersion = 0;
+    const auto epoch = OID::gen();
+
+    ChunkVersion version({epoch, Timestamp(1, 1)}, {majorVersion, minorVersion});
+    ASSERT_EQ(majorVersion, version.majorVersion());
+    ASSERT_EQ(minorVersion, version.minorVersion());
+    ASSERT_EQ(epoch, version.epoch());
+
+    ASSERT_THROWS_CODE(version.incMajor(), DBException, 31180);
+}
+
+TEST(ChunkVersionTest, ThrowsErrorIfOverflowIsAttemptedForMinorVersion) {
+    const uint32_t majorVersion = 0;
+    const uint32_t minorVersion = std::numeric_limits<uint32_t>::max();
+    const auto epoch = OID::gen();
+
+    ChunkVersion version({epoch, Timestamp(1, 1)}, {majorVersion, minorVersion});
+    ASSERT_EQ(majorVersion, version.majorVersion());
+    ASSERT_EQ(minorVersion, version.minorVersion());
+    ASSERT_EQ(epoch, version.epoch());
+
+    ASSERT_THROWS_CODE(version.incMinor(), DBException, 31181);
+}
+
+}  // namespace
+}  // namespace mongo

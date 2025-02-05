@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2020-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,59 +29,91 @@
 
 #pragma once
 
+#include <memory>
 #include <queue>
+#include <variant>
 
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/working_set.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-    class DiskLoc;
+/**
+ * A stage designed for use in unit tests. The test can queue a sequence of results which will be
+ * returned to the parent stage using the 'enqueue*()' methods.
+ */
+class MockStage final : public PlanStage {
+public:
+    static constexpr StringData kStageType = "MOCK"_sd;
+
+    MockStage(ExpressionContext* expCtx, WorkingSet* ws);
+
+    StageState doWork(WorkingSetID* out) final;
+
+    bool isEOF() const final {
+        return _results.empty();
+    }
+
+    StageType stageType() const final {
+        return STAGE_MOCK;
+    }
+
+    std::unique_ptr<PlanStageStats> getStats() final;
+
+    const SpecificStats* getSpecificStats() const final {
+        return &_specificStats;
+    }
 
     /**
-     * MockStage is a data-producing stage that is used for testing.  Unlike the other two leaf
-     * stages (CollectionScan and IndexScan) MockStage does not require any underlying storage
-     * layer.
+     * Adds a WorkingSetMember to the back of the queue.
      *
-     * A MockStage is "programmed" by pushing return values from work() onto its internal queue.
-     * Calls to MockStage::work() pop values off that queue and return them in FIFO order,
-     * annotating the working set with data when appropriate.
+     * The caller is responsible for allocating 'id' and filling out the WSM keyed by 'id'
+     * appropriately.
+     *
+     * The MockStage takes ownership of 'id', so the caller should not call WorkingSet::free()
+     * on it.
      */
-    class MockStage : public PlanStage {
-    public:
-        MockStage(WorkingSet* ws);
-        virtual ~MockStage() { }
+    void enqueueAdvanced(WorkingSetID wsid) {
+        _results.push(wsid);
+    }
 
-        virtual StageState work(WorkingSetID* out);
+    /**
+     * Adds a StageState code such as 'NEED_TIME' or 'NEED_YIELD' to the back of the queue. Illegal
+     * to call with 'ADVANCED' -- 'enqueueAdvanced()' should be used instead. Also illegal to call
+     * with 'IS_EOF', since EOF is implied when the mock stage's queue is emptied.
+     */
+    void enqueueStateCode(StageState stageState) {
+        invariant(stageState != PlanStage::ADVANCED);
+        invariant(stageState != PlanStage::IS_EOF);
+        _results.push(stageState);
+    }
 
-        virtual bool isEOF();
+    /**
+     * Adds 'status' to the queue. When the 'status' is dequeued, it will be thrown from 'work()' as
+     * an exception.
+     */
+    void enqueueError(Status status) {
+        invariant(!status.isOK());
+        _results.push(status);
+    }
 
-        // These don't really mean anything here.
-        // Some day we could count the # of calls to the yield functions to check that other stages
-        // have correct yielding behavior.
-        virtual void prepareToYield() { }
-        virtual void recoverFromYield() { }
-        virtual void invalidate(const DiskLoc& dl) { }
-        virtual PlanStageStats* getStats() { return NULL; }
+private:
+    // The mock stage holds a queue of objects of this type. Each element in the queue can either be
+    // a document to return, a StageState code, or a Status representing an error.
+    using MockResult = std::variant<WorkingSetID, PlanStage::StageState, Status>;
 
-        /**
-         * Add a result to the back of the queue.  work() goes through the queue.
-         * Either no data is returned (just a state), or...
-         */
-        void pushBack(const PlanStage::StageState state);
+    WorkingSet* _ws;
 
-        /**
-         * ...data is returned (and we ADVANCED)
-         */
-        void pushBack(const WorkingSetMember& member);
+    std::queue<MockResult> _results;
 
-    private:
-        // We don't own this.
-        WorkingSet* _ws;
-
-        // The data we return.
-        std::queue<PlanStage::StageState> _results;
-        std::queue<WorkingSetMember> _members;
-    };
+    MockStats _specificStats;
+};
 
 }  // namespace mongo

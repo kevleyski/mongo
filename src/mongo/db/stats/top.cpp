@@ -1,24 +1,24 @@
-// top.cpp
-/*
- *    Copyright (C) 2010 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -27,179 +27,270 @@
  *    it in the license file.
  */
 
-
-#include "mongo/pch.h"
+#include <algorithm>
+#include <cstddef>
+#include <iterator>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "mongo/db/stats/top.h"
 
-#include "mongo/db/auth/action_set.h"
-#include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/privilege.h"
-#include "mongo/util/net/message.h"
-#include "mongo/db/commands.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/client.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/service_context.h"
+#include "mongo/util/namespace_string_util.h"
 
 namespace mongo {
+namespace {
 
-    Top::UsageData::UsageData( const UsageData& older , const UsageData& newer ) {
-        // this won't be 100% accurate on rollovers and drop(), but at least it won't be negative
-        time  = (newer.time  >= older.time)  ? (newer.time  - older.time)  : newer.time;
-        count = (newer.count >= older.count) ? (newer.count - older.count) : newer.count;
-    }
+const auto getTop = ServiceContext::declareDecoration<Top>();
+const auto getServiceLatencyTracker = Service::declareDecoration<ServiceLatencyTracker>();
 
-    Top::CollectionData::CollectionData( const CollectionData& older , const CollectionData& newer )
-        : total( older.total , newer.total ) ,
-          readLock( older.readLock , newer.readLock ) ,
-          writeLock( older.writeLock , newer.writeLock ) ,
-          queries( older.queries , newer.queries ) ,
-          getmore( older.getmore , newer.getmore ) ,
-          insert( older.insert , newer.insert ) ,
-          update( older.update , newer.update ) ,
-          remove( older.remove , newer.remove ),
-          commands( older.commands , newer.commands ) {
-
-    }
-
-    void Top::record( const StringData& ns , int op , int lockType , long long micros , bool command ) {
-        if ( ns[0] == '?' )
-            return;
-
-        //cout << "record: " << ns << "\t" << op << "\t" << command << endl;
-        SimpleMutex::scoped_lock lk(_lock);
-
-        if ( ( command || op == dbQuery ) && ns == _lastDropped ) {
-            _lastDropped = "";
-            return;
+template <typename HistogramType>
+void incrementHistogram(OperationContext* opCtx,
+                        long long latency,
+                        HistogramType& histogram,
+                        Command::ReadWriteType readWriteType) {
+    const auto isQueryableEncryptionOperation = [&] {
+        auto curOp = CurOp::get(opCtx);
+        while (curOp) {
+            if (curOp->getShouldOmitDiagnosticInformation()) {
+                return true;
+            }
+            curOp = curOp->parent();
         }
+        return false;
+    }();
+    histogram.increment(latency, readWriteType, isQueryableEncryptionOperation);
+}
 
-        CollectionData& coll = _usage[ns];
-        _record( coll , op , lockType , micros , command );
-        _record( _global , op , lockType , micros , command );
+template <typename HistogramType>
+void incrementHistogramForUser(OperationContext* opCtx,
+                               long long latency,
+                               HistogramType& histogram,
+                               Command::ReadWriteType readWriteType) {
+    if (auto c = opCtx->getClient(); !c->isFromUserConnection() || c->isInDirectClient()) {
+        // Only update histogram if operation came from a user.
+        return;
+    }
+    incrementHistogram(opCtx, latency, histogram, readWriteType);
+}
+
+void updateCollectionData(WithLock,
+                          OperationContext* opCtx,
+                          Top::CollectionData& c,
+                          LogicalOp logicalOp,
+                          Top::LockType lockType,
+                          long long micros,
+                          Command::ReadWriteType readWriteType) {
+    if (c.isStatsRecordingAllowed) {
+        c.isStatsRecordingAllowed = !CurOp::get(opCtx)->getShouldOmitDiagnosticInformation();
     }
 
-    void Top::_record( CollectionData& c , int op , int lockType , long long micros , bool command ) {
-        c.total.inc( micros );
+    incrementHistogramForUser(opCtx, micros, c.opLatencyHistogram, readWriteType);
 
-        if ( lockType > 0 )
-            c.writeLock.inc( micros );
-        else if ( lockType < 0 )
-            c.readLock.inc( micros );
+    c.total.inc(micros);
 
-        switch ( op ) {
-        case 0:
+    if (lockType == Top::LockType::WriteLocked)
+        c.writeLock.inc(micros);
+    else if (lockType == Top::LockType::ReadLocked)
+        c.readLock.inc(micros);
+
+    switch (logicalOp) {
+        case LogicalOp::opInvalid:
             // use 0 for unknown, non-specific
             break;
-        case dbUpdate:
-            c.update.inc( micros );
+        case LogicalOp::opBulkWrite:
             break;
-        case dbInsert:
-            c.insert.inc( micros );
+        case LogicalOp::opUpdate:
+            c.update.inc(micros);
             break;
-        case dbQuery:
-            if ( command )
-                c.commands.inc( micros );
-            else
-                c.queries.inc( micros );
+        case LogicalOp::opInsert:
+            c.insert.inc(micros);
             break;
-        case dbGetMore:
-            c.getmore.inc( micros );
+        case LogicalOp::opQuery:
+            c.queries.inc(micros);
             break;
-        case dbDelete:
-            c.remove.inc( micros );
+        case LogicalOp::opGetMore:
+            c.getmore.inc(micros);
             break;
-        case dbKillCursors:
+        case LogicalOp::opDelete:
+            c.remove.inc(micros);
             break;
-        case opReply:
-        case dbMsg:
-            log() << "unexpected op in Top::record: " << op << endl;
+        case LogicalOp::opKillCursors:
+            break;
+        case LogicalOp::opCommand:
+            c.commands.inc(micros);
             break;
         default:
-            log() << "unknown op in Top::record: " << op << endl;
+            MONGO_UNREACHABLE;
+    }
+}
+}  // namespace
+
+ServiceLatencyTracker& ServiceLatencyTracker::getDecoration(Service* service) {
+    return getServiceLatencyTracker(service);
+}
+
+void ServiceLatencyTracker::increment(OperationContext* opCtx,
+                                      Microseconds latency,
+                                      Microseconds workingTime,
+                                      Command::ReadWriteType readWriteType) {
+    if (!opCtx->shouldIncrementLatencyStats())
+        return;
+
+    auto latencyCount = durationCount<Microseconds>(latency);
+    auto workingTimeCount = durationCount<Microseconds>(workingTime);
+    incrementHistogramForUser(opCtx, latencyCount, _totalTime, readWriteType);
+    incrementHistogramForUser(opCtx, workingTimeCount, _workingTime, readWriteType);
+}
+
+void ServiceLatencyTracker::appendTotalTimeStats(bool includeHistograms,
+                                                 bool slowMSBucketsOnly,
+                                                 BSONObjBuilder* builder) {
+    _totalTime.append(includeHistograms, slowMSBucketsOnly, builder);
+}
+
+void ServiceLatencyTracker::appendWorkingTimeStats(bool includeHistograms,
+                                                   bool slowMSBucketsOnly,
+                                                   BSONObjBuilder* builder) {
+    _workingTime.append(includeHistograms, slowMSBucketsOnly, builder);
+}
+
+void ServiceLatencyTracker::incrementForTransaction(OperationContext* opCtx, Microseconds latency) {
+    auto latencyCount = durationCount<Microseconds>(latency);
+    incrementHistogram(opCtx, latencyCount, _totalTime, Command::ReadWriteType::kTransaction);
+}
+
+Top& Top::getDecoration(OperationContext* opCtx) {
+    invariant(opCtx->getService()->role().hasExclusively(ClusterRole::ShardServer));
+    return getTop(opCtx->getServiceContext());
+}
+
+void Top::record(OperationContext* opCtx,
+                 const NamespaceString& nss,
+                 LogicalOp logicalOp,
+                 LockType lockType,
+                 Microseconds micros,
+                 bool command,
+                 Command::ReadWriteType readWriteType) {
+    const auto nssStr = NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault());
+    if (nssStr[0] == '?')
+        return;
+
+    auto hashedNs = UsageMap::hasher().hashed_key(nssStr);
+    auto microsCount = durationCount<Microseconds>(micros);
+    stdx::lock_guard lk(_lockUsage);
+    CollectionData& coll = _usage[hashedNs];
+    updateCollectionData(lk, opCtx, coll, logicalOp, lockType, microsCount, readWriteType);
+}
+
+void Top::record(OperationContext* opCtx,
+                 std::span<const NamespaceString> nssSet,
+                 LogicalOp logicalOp,
+                 LockType lockType,
+                 Microseconds micros,
+                 bool command,
+                 Command::ReadWriteType readWriteType) {
+    std::vector<std::string> hashedSet;
+    hashedSet.reserve(nssSet.size());
+    for (auto& nss : nssSet) {
+        const auto nssStr =
+            NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault());
+        if (nssStr[0] != '?') {
+            hashedSet.emplace_back(UsageMap::hasher().hashed_key(nssStr));
         }
-
     }
 
-    void Top::collectionDropped( const StringData& ns ) {
-        SimpleMutex::scoped_lock lk(_lock);
-        _usage.erase(ns);
-        _lastDropped = ns.toString();
+    auto microsCount = durationCount<Microseconds>(micros);
+    stdx::lock_guard lk(_lockUsage);
+    for (const auto& hashedNs : hashedSet) {
+        CollectionData& coll = _usage[hashedNs];
+        updateCollectionData(lk, opCtx, coll, logicalOp, lockType, microsCount, readWriteType);
+    }
+}
+
+void Top::collectionDropped(const NamespaceString& nss) {
+    const auto nssStr = NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault());
+    stdx::lock_guard lk(_lockUsage);
+    _usage.erase(nssStr);
+}
+
+void Top::appendStatsEntry(BSONObjBuilder& b, StringData name, const UsageData& data) {
+    BSONObjBuilder bb(b.subobjStart(name));
+    bb.appendNumber("time", data.time);
+    bb.appendNumber("count", data.count);
+    bb.done();
+}
+
+void Top::appendUsageStatsForCollection(BSONObjBuilder& result, const CollectionData& coll) {
+    appendStatsEntry(result, "total", coll.total);
+
+    appendStatsEntry(result, "readLock", coll.readLock);
+    appendStatsEntry(result, "writeLock", coll.writeLock);
+
+    appendStatsEntry(result, "queries", coll.queries);
+    appendStatsEntry(result, "getmore", coll.getmore);
+    appendStatsEntry(result, "insert", coll.insert);
+    appendStatsEntry(result, "update", coll.update);
+    appendStatsEntry(result, "remove", coll.remove);
+    appendStatsEntry(result, "commands", coll.commands);
+}
+
+void Top::append(BSONObjBuilder& topStatsBuilder) {
+    stdx::lock_guard lk(_lockUsage);
+
+    // Pull all the names into a vector so we can sort them for the user.
+    std::vector<std::string> names;
+    for (UsageMap::const_iterator i = _usage.begin(); i != _usage.end(); ++i) {
+        names.push_back(i->first);
     }
 
-    void Top::cloneMap(Top::UsageMap& out) const {
-        SimpleMutex::scoped_lock lk(_lock);
-        out = _usage;
-    }
+    std::sort(names.begin(), names.end());
 
-    void Top::append( BSONObjBuilder& b ) {
-        SimpleMutex::scoped_lock lk( _lock );
-        _appendToUsageMap( b , _usage );
-    }
+    for (size_t i = 0; i < names.size(); i++) {
+        BSONObjBuilder bb(topStatsBuilder.subobjStart(names[i]));
 
-    void Top::_appendToUsageMap( BSONObjBuilder& b , const UsageMap& map ) const {
-        // pull all the names into a vector so we can sort them for the user
-        
-        vector<string> names;
-        for ( UsageMap::const_iterator i = map.begin(); i != map.end(); ++i ) {
-            names.push_back( i->first );
+        const CollectionData& coll = _usage.find(names[i])->second;
+        auto pos = names[i].find('.');
+        if (coll.isStatsRecordingAllowed &&
+            !NamespaceString::isFLE2StateCollection(names[i].substr(pos + 1))) {
+            appendUsageStatsForCollection(topStatsBuilder, coll);
         }
-        
-        std::sort( names.begin(), names.end() );
-
-        for ( size_t i=0; i<names.size(); i++ ) {
-            BSONObjBuilder bb( b.subobjStart( names[i] ) );
-
-            const CollectionData& coll = map.find(names[i])->second;
-
-            _appendStatsEntry( b , "total" , coll.total );
-
-            _appendStatsEntry( b , "readLock" , coll.readLock );
-            _appendStatsEntry( b , "writeLock" , coll.writeLock );
-
-            _appendStatsEntry( b , "queries" , coll.queries );
-            _appendStatsEntry( b , "getmore" , coll.getmore );
-            _appendStatsEntry( b , "insert" , coll.insert );
-            _appendStatsEntry( b , "update" , coll.update );
-            _appendStatsEntry( b , "remove" , coll.remove );
-            _appendStatsEntry( b , "commands" , coll.commands );
-
-            bb.done();
-        }
-    }
-
-    void Top::_appendStatsEntry( BSONObjBuilder& b , const char * statsName , const UsageData& map ) const {
-        BSONObjBuilder bb( b.subobjStart( statsName ) );
-        bb.appendNumber( "time" , map.time );
-        bb.appendNumber( "count" , map.count );
         bb.done();
     }
-
-    class TopCmd : public Command {
-    public:
-        TopCmd() : Command( "top", true ) {}
-
-        virtual bool slaveOk() const { return true; }
-        virtual bool adminOnly() const { return true; }
-        virtual LockType locktype() const { return NONE; }
-        virtual void help( stringstream& help ) const { help << "usage by collection, in micros "; }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::top);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-        }
-        virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            {
-                BSONObjBuilder b( result.subobjStart( "totals" ) );
-                b.append( "note" , "all times in microseconds" );
-                Top::global.append( b );
-                b.done();
-            }
-            return true;
-        }
-
-    } topCmd;
-
-    Top Top::global;
-
 }
+
+void Top::appendLatencyStats(const NamespaceString& nss,
+                             bool includeHistograms,
+                             BSONObjBuilder* builder) {
+    const auto nssStr = NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault());
+    auto hashedNs = UsageMap::hasher().hashed_key(nssStr);
+    stdx::lock_guard lk(_lockUsage);
+    BSONObjBuilder latencyStatsBuilder;
+    _usage[hashedNs].opLatencyHistogram.append(includeHistograms, false, &latencyStatsBuilder);
+    builder->append("ns", nssStr);
+    builder->append("latencyStats", latencyStatsBuilder.obj());
+}
+
+void Top::appendOperationStats(const NamespaceString& nss, BSONObjBuilder* builder) {
+    const auto nssStr = NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault());
+    auto hashedNs = UsageMap::hasher().hashed_key(nssStr);
+    stdx::lock_guard lk(_lockUsage);
+    BSONObjBuilder opStatsBuilder;
+
+    // Appends usage statistics to operationStats object.
+    const CollectionData& coll = _usage[hashedNs];
+    auto pos = nssStr.find('.');
+    if (coll.isStatsRecordingAllowed &&
+        !NamespaceString::isFLE2StateCollection(nssStr.substr(pos + 1))) {
+        appendUsageStatsForCollection(opStatsBuilder, coll);
+    }
+
+    // Appends operationStats BSONbuilder object to return output.
+    builder->append("ns", nssStr);
+    builder->append("operationStats", opStatsBuilder.obj());
+}
+}  // namespace mongo

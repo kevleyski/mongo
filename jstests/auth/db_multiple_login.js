@@ -1,54 +1,21 @@
-// Test the behavior when two users from the same database are authenticated serially on a single
-// connection.  Expected behavior is that the first user is implicitly logged out by the second
-// authentication.
-//
-// Regression test for SERVER-8144.
+// Test that only one user may be authenticated against the database at a time.
 
-// Raises an exception if "status" is not a GetLastError object indicating success.
-function assertGLEOK(status) {
-    assert(status.ok && status.err === null,
-           "Expected OK status object; found " + tojson(status));
-}
+const conn = MongoRunner.runMongod({auth: ''});
+const admin = conn.getDB('admin');
+const test = conn.getDB('test');
 
-// Raises an exception if "status" is not a GetLastError object indicating failure.
-function assertGLENotOK(status) {
-    assert(status.ok && status.err !== null,
-           "Expected not-OK status object; found " + tojson(status));
-}
+admin.createUser({user: 'admin', pwd: 'pwd', roles: jsTest.adminUserRoles});
+assert(admin.auth('admin', 'pwd'));
+test.createUser({user: 'user', pwd: 'pwd', roles: ['readWrite']});
 
-// Asserts that inserting "obj" into "collection" succeeds.
-function assertInsertSucceeds(collection, obj) {
-    collection.insert(obj);
-    assertGLEOK(collection.getDB().getLastErrorObj());
-}
+jsTest.log('Testing multi-auth');
+assert(!test.auth('user', 'pwd'));
 
-// Asserts that inserting "obj" into "collection" fails.
-function assertInsertFails(collection, obj) {
-    collection.insert(obj);
-    assertGLENotOK(collection.getDB().getLastErrorObj());
-}
-
-
-var conn = MongoRunner.runMongod({ auth: "", smallfiles: "" });
-var admin = conn.getDB("admin");
-var test = conn.getDB("test");
-
-admin.createUser({user:'admin', pwd: 'a', roles: jsTest.adminUserRoles});
-assert(admin.auth('admin', 'a'));
-test.createUser({user: 'reader', pwd: 'a', roles: [ "read" ]});
-test.createUser({user: 'writer', pwd: 'a', roles: [ "readWrite" ]});
+jsTest.log('Testing re-auth after logout');
 admin.logout();
+assert(test.auth('user', 'pwd'));
+test.logout();
 
-// Nothing logged in, can neither read nor write.
-assertInsertFails(test.docs, { value: 0 });
-assert.throws(function() { test.foo.findOne() });
-
-// Writer logged in, can read and write.
-test.auth('writer', 'a');
-assertInsertSucceeds(test.docs, { value: 1 });
-test.foo.findOne();
-
-// Reader logged in, replacing writer, can only read.
-test.auth('reader', 'a');
-assertInsertFails(test.docs, { value: 2 });
-test.foo.findOne();
+jsTest.log('Shutting down');
+assert(admin.auth('admin', 'pwd'));
+MongoRunner.stopMongod(conn);

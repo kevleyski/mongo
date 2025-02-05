@@ -1,1132 +1,1001 @@
 /**
- * Copyright (c) 2011 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
-#include "mongo/pch.h"
-
+#include <absl/container/flat_hash_map.h>
+#include <boost/intrusive_ptr.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
-#include <boost/unordered_map.hpp>
-#include <deque>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstddef>
+#include <functional>
+#include <iterator>
+#include <list>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/clientcursor.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/collection_index_usage_tracker.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/scoped_timer.h"
+#include "mongo/db/feature_flag.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/matcher.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/matcher/expression_algo.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/expression.h"
-#include "mongo/db/pipeline/value.h"
-#include "mongo/db/projection.h"
-#include "mongo/db/sorter/sorter.h"
-#include "mongo/s/shard.h"
-#include "mongo/s/strategy.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/db/query/client_cursor/generic_cursor.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/query/util/deferred.h"
+#include "mongo/db/service_context.h"
+#include "mongo/platform/basic.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
-    class Accumulator;
-    class Cursor;
-    class Document;
-    class Expression;
-    class ExpressionFieldPath;
-    class ExpressionObject;
-    class DocumentSourceLimit;
 
-    class DocumentSource : public IntrusiveCounterUnsigned {
-    public:
-        virtual ~DocumentSource() {}
+class Document;
 
-        /** Returns the next Document if there is one or boost::none if at EOF.
-         *  Subclasses must call pExpCtx->checkForInterupt().
-         */
-        virtual boost::optional<Document> getNext() = 0;
+/**
+ * Registers a DocumentSource to have the name 'key'.
+ *
+ * 'liteParser' takes an AggregateCommandRequest and a BSONElement and returns a
+ * LiteParsedDocumentSource. This is used for checks that need to happen before a full parse,
+ * such as checks about which namespaces are referenced by this aggregation.
+ *
+ * 'fullParser' is either a DocumentSource::SimpleParser or a DocumentSource::Parser.
+ * In both cases, it takes a BSONElement and an ExpressionContext and returns fully-executable
+ * DocumentSource(s), for optimization and execution. In the common case it's a SimpleParser,
+ * which returns a single DocumentSource; in the general case it's a Parser, which returns a whole
+ * std::list to support "multi-stage aliases" like $bucket.
+ *
+ * Stages that do not require any special pre-parse checks can use
+ * LiteParsedDocumentSourceDefault::parse as their 'liteParser'.
+ *
+ * As an example, if your stage DocumentSourceFoo looks like {$foo: <args>} and does *not* require
+ * any special pre-parse checks, you should implement a static parser like
+ * DocumentSourceFoo::createFromBson(), and register it like so:
+ * REGISTER_DOCUMENT_SOURCE(foo,
+ *                          LiteParsedDocumentSourceDefault::parse,
+ *                          DocumentSourceFoo::createFromBson);
+ */
+#define REGISTER_DOCUMENT_SOURCE(key, liteParser, fullParser, allowedWithApiStrict) \
+    REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(key,                                     \
+                                           liteParser,                              \
+                                           fullParser,                              \
+                                           allowedWithApiStrict,                    \
+                                           AllowedWithClientType::kAny,             \
+                                           boost::none,                             \
+                                           true)
 
-        /**
-         * Inform the source that it is no longer needed and may release its resources.  After
-         * dispose() is called the source must still be able to handle iteration requests, but may
-         * become eof().
-         * NOTE: For proper mutex yielding, dispose() must be called on any DocumentSource that will
-         * not be advanced until eof(), see SERVER-6123.
-         */
-        virtual void dispose();
+/**
+ * Like REGISTER_DOCUMENT_SOURCE, except the parser will only be registered when featureFlag is
+ * enabled. We store featureFlag in the parserMap, so that it can be checked at runtime
+ * to correctly enable/disable the parser.
+ */
+#define REGISTER_DOCUMENT_SOURCE_WITH_FEATURE_FLAG(                     \
+    key, liteParser, fullParser, allowedWithApiStrict, featureFlag)     \
+    REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(key,                         \
+                                           liteParser,                  \
+                                           fullParser,                  \
+                                           allowedWithApiStrict,        \
+                                           AllowedWithClientType::kAny, \
+                                           featureFlag,                 \
+                                           true)
 
-        /**
-           Get the source's name.
+/**
+ * Registers a DocumentSource which cannot be exposed to the users.
+ */
+#define REGISTER_INTERNAL_DOCUMENT_SOURCE(key, liteParser, fullParser, condition) \
+    REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(key,                                   \
+                                           liteParser,                            \
+                                           fullParser,                            \
+                                           AllowedWithApiStrict::kInternal,       \
+                                           AllowedWithClientType::kInternal,      \
+                                           boost::none,                           \
+                                           condition)
 
-           @returns the string name of the source as a constant string;
-             this is static, and there's no need to worry about adopting it
-         */
-        virtual const char *getSourceName() const;
+/**
+ * You can specify a condition, evaluated during startup,
+ * that decides whether to register the parser.
+ *
+ * For example, you could check a feature flag, and register the parser only when it's enabled.
+ *
+ * Note that the condition is evaluated only once, during a MONGO_INITIALIZER. Don't specify
+ * a condition that can change at runtime, such as FCV. (Feature flags are ok, because they
+ * cannot be toggled at runtime.)
+ *
+ * This is the most general REGISTER_DOCUMENT_SOURCE* macro, which all others should delegate to.
+ */
+#define REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(                                                   \
+    key, liteParser, fullParser, allowedWithApiStrict, clientType, featureFlag, ...)              \
+    MONGO_INITIALIZER_GENERAL(addToDocSourceParserMap_##key,                                      \
+                              ("BeginDocumentSourceRegistration"),                                \
+                              ("EndDocumentSourceRegistration"))                                  \
+    (InitializerContext*) {                                                                       \
+        if (!__VA_ARGS__ ||                                                                       \
+            (boost::optional<FeatureFlag>(featureFlag) != boost::none &&                          \
+             !boost::optional<FeatureFlag>(featureFlag)                                           \
+                  ->isEnabledUseLatestFCVWhenUninitialized(                                       \
+                      serverGlobalParams.featureCompatibility.acquireFCVSnapshot()))) {           \
+            DocumentSource::registerParser("$" #key, DocumentSource::parseDisabled, featureFlag); \
+            LiteParsedDocumentSource::registerParser("$" #key,                                    \
+                                                     LiteParsedDocumentSource::parseDisabled,     \
+                                                     allowedWithApiStrict,                        \
+                                                     clientType);                                 \
+            return;                                                                               \
+        }                                                                                         \
+        LiteParsedDocumentSource::registerParser(                                                 \
+            "$" #key, liteParser, allowedWithApiStrict, clientType);                              \
+        DocumentSource::registerParser("$" #key, fullParser, featureFlag);                        \
+    }
 
-        /**
-          Set the underlying source this source should use to get Documents
-          from.
+/**
+ * Like REGISTER_DOCUMENT_SOURCE, except the parser is only enabled when test-commands are enabled.
+ */
+#define REGISTER_TEST_DOCUMENT_SOURCE(key, liteParser, fullParser)                 \
+    REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(key,                                    \
+                                           liteParser,                             \
+                                           fullParser,                             \
+                                           AllowedWithApiStrict::kNeverInVersion1, \
+                                           AllowedWithClientType::kAny,            \
+                                           boost::none,                            \
+                                           ::mongo::getTestCommandsEnabled())
 
-          It is an error to set the source more than once.  This is to
-          prevent changing sources once the original source has been started;
-          this could break the state maintained by the DocumentSource.
+/**
+ * Allocates a new, unique DocumentSource::Id value.
+ * Assigns it to a private variable (in an anonymous namespace) based on the given `name`, and
+ * declares a const reference named `constName` to the private variable.
+ */
+#define ALLOCATE_DOCUMENT_SOURCE_ID(name, constName)                  \
+    namespace {                                                       \
+    DocumentSource::Id _dsid_##name = DocumentSource::kUnallocatedId; \
+    MONGO_INITIALIZER_GENERAL(allocateDocSourceId_##name,             \
+                              ("BeginDocumentSourceIdAllocation"),    \
+                              ("EndDocumentSourceIdAllocation"))      \
+    (InitializerContext*) {                                           \
+        _dsid_##name = DocumentSource::allocateId(#name);             \
+    }                                                                 \
+    }                                                                 \
+    const DocumentSource::Id& constName = _dsid_##name;
 
-          This pointer is not reference counted because that has led to
-          some circular references.  As a result, this doesn't keep
-          sources alive, and is only intended to be used temporarily for
-          the lifetime of a Pipeline::run().
+class DocumentSource : public RefCountable {
+public:
+    // In general a parser returns a list of DocumentSources, to accomodate "multi-stage aliases"
+    // like $bucket.
+    using Parser = std::function<std::list<boost::intrusive_ptr<DocumentSource>>(
+        BSONElement, const boost::intrusive_ptr<ExpressionContext>&)>;
+    // But in the common case a parser returns only one DocumentSource.
+    using SimpleParser = std::function<boost::intrusive_ptr<DocumentSource>(
+        BSONElement, const boost::intrusive_ptr<ExpressionContext>&)>;
 
-          @param pSource the underlying source to use
-         */
-        virtual void setSource(DocumentSource *pSource);
-
-        /**
-          Attempt to coalesce this DocumentSource with its successor in the
-          document processing pipeline.  If successful, the successor
-          DocumentSource should be removed from the pipeline and discarded.
-
-          If successful, this operation can be applied repeatedly, in an
-          attempt to coalesce several sources together.
-
-          The default implementation is to do nothing, and return false.
-
-          @param pNextSource the next source in the document processing chain.
-          @returns whether or not the attempt to coalesce was successful or not;
-            if the attempt was not successful, nothing has been changed
-         */
-        virtual bool coalesce(const intrusive_ptr<DocumentSource> &pNextSource);
-
-        /**
-          Optimize the pipeline operation, if possible.  This is a local
-          optimization that only looks within this DocumentSource.  For best
-          results, first coalesce compatible sources using coalesce().
-
-          This is intended for any operations that include expressions, and
-          provides a hook for those to optimize those operations.
-
-          The default implementation is to do nothing.
-         */
-        virtual void optimize();
-
-        enum GetDepsReturn {
-            NOT_SUPPORTED, // This means the set should be ignored and the full object is required.
-            EXHAUSTIVE, // This means that everything needed should be in the set
-            SEE_NEXT, // Add the next Source's deps to the set
-        };
-
-        /** Get the fields this operation needs to do its job.
-         *  Deps should be in "a.b.c" notation
-         *  An empty string in deps means the whole document is needed.
-         *
-         *  @param deps results are added here. NOT CLEARED
-         */
-        virtual GetDepsReturn getDependencies(set<string>& deps) const {
-            return NOT_SUPPORTED;
-        }
-
-        /** This takes dependencies from getDependencies and
-         *  returns a projection that includes all of them
-         */
-        static BSONObj depsToProjection(const set<string>& deps);
-
-        /** These functions take the same input as depsToProjection but are able to
-         *  produce a Document from a BSONObj with the needed fields much faster.
-         */
-        typedef Document ParsedDeps; // See implementation for structure
-        static ParsedDeps parseDeps(const set<string>& deps);
-        static Document documentFromBsonWithDeps(const BSONObj& object, const ParsedDeps& deps);
-
-        /**
-         * In the default case, serializes the DocumentSource and adds it to the vector<Value>.
-         *
-         * A subclass may choose to overwrite this, rather than serialize,
-         * if it should output multiple stages (eg, $sort sometimes also outputs a $limit).
-         */
-
-        virtual void serializeToArray(vector<Value>& array, bool explain = false) const;
-
-        /// Returns true if doesn't require an input source (most DocumentSources do).
-        virtual bool isValidInitialSource() const { return false; }
-        
-    protected:
-        /**
-           Base constructor.
-         */
-        DocumentSource(const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        /*
-          Most DocumentSources have an underlying source they get their data
-          from.  This is a convenience for them.
-
-          The default implementation of setSource() sets this; if you don't
-          need a source, override that to verify().  The default is to
-          verify() if this has already been set.
-        */
-        DocumentSource *pSource;
-
-        intrusive_ptr<ExpressionContext> pExpCtx;
-
-    private:
-        /**
-         * Create a Value that represents the document source.
-         *
-         * This is used by the default implementation of serializeToArray() to add this object
-         * to a pipeline being serialized. Returning a missing() Value results in no entry
-         * being added to the array for this stage (DocumentSource).
-         */
-        virtual Value serialize(bool explain = false) const = 0;
-    };
-
-    /** This class marks DocumentSources that should be split between the merger and the shards.
-     *  See Pipeline::Optimizations::Sharded::findSplitPoint() for details.
-     */
-    class SplittableDocumentSource {
-    public:
-        /** returns a source to be run on the shards.
-         *  if NULL, don't run on shards
-         */
-        virtual intrusive_ptr<DocumentSource> getShardSource() = 0;
-
-        /** returns a source that combines results from shards.
-         *  if NULL, don't run on merger
-         */
-        virtual intrusive_ptr<DocumentSource> getMergeSource() = 0;
-    protected:
-        // It is invalid to delete through a SplittableDocumentSource-typed pointer.
-        virtual ~SplittableDocumentSource() {}
-    };
-
-
-    /** This class marks DocumentSources which need mongod-specific functionality.
-     *  It causes a MongodInterface to be injected when in a mongod and prevents mongos from
-     *  merging pipelines containing this stage.
-     */
-    class DocumentSourceNeedsMongod {
-    public:
-        // Wraps mongod-specific functions to allow linking into mongos.
-        class MongodInterface {
-        public:
-            virtual ~MongodInterface() {};
-
-            virtual DBClientBase* directClient() = 0; // Always returns a DBDirectClient
-
-            // Note that in some rare cases this could return a false negative but will never return
-            // a false positive. This method will be fixed in the future once it becomes possible to
-            // avoid false negatives.
-            virtual bool isSharded(const NamespaceString& ns) = 0;
-
-            virtual bool isCapped(const NamespaceString& ns) = 0;
-
-            // Add new methods as needed.
-        };
-
-        void injectMongodInterface(boost::shared_ptr<MongodInterface> mongod) {
-            _mongod = mongod;
-        }
-
-    protected:
-        // It is invalid to delete through a DocumentSourceNeedsMongod-typed pointer.
-        virtual ~DocumentSourceNeedsMongod() {}
-
-        // Gives subclasses access to a MongodInterface implementation
-        shared_ptr<MongodInterface> _mongod;
-    };
-
-
-    class DocumentSourceBsonArray :
-        public DocumentSource {
-    public:
-        // virtuals from DocumentSource
-        virtual boost::optional<Document> getNext();
-        virtual Value serialize(bool explain = false) const;
-        virtual void setSource(DocumentSource *pSource);
-        virtual bool isValidInitialSource() const { return true; }
-
-        /**
-          Create a document source based on a BSON array.
-
-          This is usually put at the beginning of a chain of document sources
-          in order to fetch data from the database.
-
-          CAUTION:  the BSON is not read until the source is used.  Any
-          elements that appear after these documents must not be read until
-          this source is exhausted.
-
-          @param array the BSON array to treat as a document source
-          @param pExpCtx the expression context for the pipeline
-          @returns the newly created document source
-        */
-        static intrusive_ptr<DocumentSourceBsonArray> create(
-            const BSONObj& array,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-    private:
-        DocumentSourceBsonArray(
-            const BSONObj& embeddedArray,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        BSONObj embeddedObject;
-        BSONObjIterator arrayIterator;
-    };
-
-    
-    class DocumentSourceCommandShards :
-        public DocumentSource {
-    public:
-        // virtuals from DocumentSource
-        virtual boost::optional<Document> getNext();
-        virtual Value serialize(bool explain = false) const;
-        virtual void setSource(DocumentSource *pSource);
-        virtual bool isValidInitialSource() const { return true; }
-
-        /* convenient shorthand for a commonly used type */
-        typedef vector<Strategy::CommandResult> ShardOutput;
-
-        /** Returns the result arrays from shards using the 2.4 protocol.
-         *  Call this instead of getNext() if you want access to the raw streams.
-         *  This method should only be called at most once.
-         */
-        vector<BSONArray> getArrays();
-
-        /**
-          Create a DocumentSource that wraps the output of many shards
-
-          @param shardOutput output from the individual shards
-          @param pExpCtx the expression context for the pipeline
-          @returns the newly created DocumentSource
-         */
-        static intrusive_ptr<DocumentSourceCommandShards> create(
-            const ShardOutput& shardOutput,
-            const intrusive_ptr<ExpressionContext>& pExpCtx);
-
-    private:
-        DocumentSourceCommandShards(const ShardOutput& shardOutput,
-            const intrusive_ptr<ExpressionContext>& pExpCtx);
-
-        /**
-          Advance to the next document, setting pCurrent appropriately.
-
-          Adjusts pCurrent, pBsonSource, and iterator, as needed.  On exit,
-          pCurrent is the Document to return, or NULL.  If NULL, this
-          indicates there is nothing more to return.
-         */
-        void getNextDocument();
-
-        bool unstarted;
-        bool hasCurrent;
-        bool newSource; // set to true for the first item of a new source
-        intrusive_ptr<DocumentSourceBsonArray> pBsonSource;
-        Document pCurrent;
-        ShardOutput::const_iterator iterator;
-        ShardOutput::const_iterator listEnd;
-    };
-
+    using ChangeStreamRequirement = StageConstraints::ChangeStreamRequirement;
+    using HostTypeRequirement = StageConstraints::HostTypeRequirement;
+    using PositionRequirement = StageConstraints::PositionRequirement;
+    using DiskUseRequirement = StageConstraints::DiskUseRequirement;
+    using FacetRequirement = StageConstraints::FacetRequirement;
+    using StreamType = StageConstraints::StreamType;
+    using TransactionRequirement = StageConstraints::TransactionRequirement;
+    using LookupRequirement = StageConstraints::LookupRequirement;
+    using UnionRequirement = StageConstraints::UnionRequirement;
 
     /**
-     * Constructs and returns Documents from the BSONObj objects produced by a supplied Cursor.
-     * An object of this type may only be used by one thread, see SERVER-6123.
+     * Used to identify different DocumentSource sub-classes, without requiring RTTI.
      */
-    class DocumentSourceCursor :
-        public DocumentSource {
-    public:
-        // virtuals from DocumentSource
-        virtual ~DocumentSourceCursor();
-        virtual boost::optional<Document> getNext();
-        virtual const char *getSourceName() const;
-        virtual Value serialize(bool explain = false) const;
-        virtual void setSource(DocumentSource *pSource);
-        virtual bool coalesce(const intrusive_ptr<DocumentSource>& nextSource);
-        virtual bool isValidInitialSource() const { return true; }
+    using Id = unsigned long;
 
-        /**
-         * Release the Cursor and the read lock it requires, but without changing the other data.
-         * Releasing the lock is required for proper concurrency, see SERVER-6123.  This
-         * functionality is also used by the explain version of pipeline execution.
-         */
-        virtual void dispose();
+    // Using 0 for "unallocated id" makes it easy to check if an Id has been allocated.
+    static constexpr Id kUnallocatedId{0};
 
-        /**
-         * Create a document source based on a passed-in cursor.
-         *
-         * This is usually put at the beginning of a chain of document sources
-         * in order to fetch data from the database.
-         *
-         * The DocumentSource takes ownership of the cursor and will destroy it
-         * when the DocumentSource is finished with the cursor, if it hasn't
-         * already been destroyed.
-         *
-         * @param ns the namespace the cursor is over
-         * @param cursorId the id of the cursor to use
-         * @param pExpCtx the expression context for the pipeline
-         */
-        static intrusive_ptr<DocumentSourceCursor> create(
-            const string& ns,
-            CursorId cursorId,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        /*
-          Record the namespace.  Required for explain.
-
-          @param namespace the namespace
-        */
-
-        /*
-          Record the query that was specified for the cursor this wraps, if
-          any.
-
-          This should be captured after any optimizations are applied to
-          the pipeline so that it reflects what is really used.
-
-          This gets used for explain output.
-
-          @param pBsonObj the query to record
-         */
-        void setQuery(const BSONObj& query) { _query = query; }
-
-        /*
-          Record the sort that was specified for the cursor this wraps, if
-          any.
-
-          This should be captured after any optimizations are applied to
-          the pipeline so that it reflects what is really used.
-
-          This gets used for explain output.
-
-          @param pBsonObj the sort to record
-         */
-        void setSort(const BSONObj& sort) { _sort = sort; }
-
-        void setProjection(const BSONObj& projection, const ParsedDeps& deps);
-
-        /// returns -1 for no limit
-        long long getLimit() const;
-
-    private:
-        DocumentSourceCursor(
-            const string& ns,
-            CursorId cursorId,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        void loadBatch();
-
-        std::deque<Document> _currentBatch;
-
-        // BSONObj members must outlive _projection and cursor.
-        BSONObj _query;
-        BSONObj _sort;
-        shared_ptr<Projection> _projection; // shared with pClientCursor
-        ParsedDeps _dependencies;
-        intrusive_ptr<DocumentSourceLimit> _limit;
-        long long _docsAddedToBatches; // for _limit enforcement
-
-        string ns; // namespace
-        CursorId _cursorId;
-        CollectionMetadataPtr _collMetadata;
-
-        bool canUseCoveredIndex(ClientCursor* cursor) const;
-
-        /*
-          Yield the cursor sometimes.
-
-          If the state of the world changed during the yield such that we
-          are unable to continue execution of the query, this will release the
-          client cursor, and throw an error.  NOTE This differs from the
-          behavior of most other operations, see SERVER-2454.
-         */
-        void yieldSometimes(ClientCursor* cursor);
+    struct ParserRegistration {
+        DocumentSource::Parser parser;
+        boost::optional<FeatureFlag> featureFlag;
     };
 
-
-    class DocumentSourceGroup : public DocumentSource
-                              , public SplittableDocumentSource {
+    /**
+     * This is what is returned from the main DocumentSource API: getNext(). It is essentially a
+     * (ReturnStatus, Document) pair, with the first entry being used to communicate information
+     * about the execution of the DocumentSource, such as whether or not it has been exhausted.
+     */
+    class GetNextResult {
     public:
-        // virtuals from DocumentSource
-        virtual boost::optional<Document> getNext();
-        virtual const char *getSourceName() const;
-        virtual void optimize();
-        virtual GetDepsReturn getDependencies(set<string>& deps) const;
-        virtual void dispose();
-        virtual Value serialize(bool explain = false) const;
-
-        /**
-          Create a new grouping DocumentSource.
-          
-          @param pExpCtx the expression context for the pipeline
-          @returns the DocumentSource
-         */
-        static intrusive_ptr<DocumentSourceGroup> create(
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        /**
-          Set the Id Expression.
-
-          Documents that pass through the grouping Document are grouped
-          according to this key.  This will generate the id_ field in the
-          result documents.
-
-          @param pExpression the group key
-         */
-        void setIdExpression(const intrusive_ptr<Expression> &pExpression);
-
-        /**
-          Add an accumulator.
-
-          Accumulators become fields in the Documents that result from
-          grouping.  Each unique group document must have it's own
-          accumulator; the accumulator factory is used to create that.
-
-          @param fieldName the name the accumulator result will have in the
-                result documents
-          @param pAccumulatorFactory used to create the accumulator for the
-                group field
-         */
-        void addAccumulator(const std::string& fieldName,
-                            intrusive_ptr<Accumulator> (*pAccumulatorFactory)(),
-                            const intrusive_ptr<Expression> &pExpression);
-
-        /// Tell this source if it is doing a merge from shards. Defaults to false.
-        void setDoingMerge(bool doingMerge) { _doingMerge = doingMerge; }
-
-        /**
-          Create a grouping DocumentSource from BSON.
-
-          This is a convenience method that uses the above, and operates on
-          a BSONElement that has been deteremined to be an Object with an
-          element named $group.
-
-          @param pBsonElement the BSONELement that defines the group
-          @param pExpCtx the expression context
-          @returns the grouping DocumentSource
-         */
-        static intrusive_ptr<DocumentSource> createFromBson(
-            BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        // Virtuals for SplittableDocumentSource
-        virtual intrusive_ptr<DocumentSource> getShardSource();
-        virtual intrusive_ptr<DocumentSource> getMergeSource();
-
-        static const char groupName[];
-
-    private:
-        DocumentSourceGroup(const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        /// Spill groups map to disk and returns an iterator to the file.
-        shared_ptr<Sorter<Value, Value>::Iterator> spill();
-
-        // Only used by spill. Would be function-local if that were legal in C++03.
-        class SpillSTLComparator;
-
-        /*
-          Before returning anything, this source must fetch everything from
-          the underlying source and group it.  populate() is used to do that
-          on the first call to any method on this source.  The populated
-          boolean indicates that this has been done.
-         */
-        void populate();
-        bool populated;
-
-        intrusive_ptr<Expression> pIdExpression;
-
-        typedef vector<intrusive_ptr<Accumulator> > Accumulators;
-        typedef boost::unordered_map<Value, Accumulators, Value::Hash> GroupsMap;
-        GroupsMap groups;
-
-        /*
-          The field names for the result documents and the accumulator
-          factories for the result documents.  The Expressions are the
-          common expressions used by each instance of each accumulator
-          in order to find the right-hand side of what gets added to the
-          accumulator.  Note that each of those is the same for each group,
-          so we can share them across all groups by adding them to the
-          accumulators after we use the factories to make a new set of
-          accumulators for each new group.
-
-          These three vectors parallel each other.
-        */
-        vector<string> vFieldName;
-        vector<intrusive_ptr<Accumulator> (*)()> vpAccumulatorFactory;
-        vector<intrusive_ptr<Expression> > vpExpression;
-
-
-        Document makeDocument(const Value& id, const Accumulators& accums, bool mergeableOutput);
-
-        bool _doingMerge;
-        bool _spilled;
-        const bool _extSortAllowed;
-        const int _maxMemoryUsageBytes;
-
-        // only used when !_spilled
-        GroupsMap::iterator groupsIterator;
-
-        // only used when _spilled
-        scoped_ptr<Sorter<Value, Value>::Iterator> _sorterIterator;
-        pair<Value, Value> _firstPartOfNextGroup;
-        Value _currentId;
-        Accumulators _currentAccumulators;
-    };
-
-
-    class DocumentSourceMatch : public DocumentSource {
-    public:
-        // virtuals from DocumentSource
-        virtual boost::optional<Document> getNext();
-        virtual const char *getSourceName() const;
-        virtual bool coalesce(const intrusive_ptr<DocumentSource>& nextSource);
-        virtual Value serialize(bool explain = false) const;
-
-        /**
-          Create a filter.
-
-          @param pBsonElement the raw BSON specification for the filter
-          @returns the filter
-         */
-        static intrusive_ptr<DocumentSource> createFromBson(
-            BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pCtx);
-
-        /// Returns the query in Matcher syntax.
-        BSONObj getQuery() const;
-
-        static const char matchName[];
-
-        /** Returns the portion of the match that can safely be promoted to before a $redact.
-         *  If this returns an empty BSONObj, no part of this match may safely be promoted.
-         *
-         *  To be safe to promote, removing a field from a document to be matched must not cause
-         *  that document to be accepted when it would otherwise be rejected. As an example,
-         *  {name: {$ne: "bob smith"}} accepts documents without a name field, which means that
-         *  running this filter before a redact that would remove the name field would leak
-         *  information. On the other hand, {age: {$gt:5}} is ok because it doesn't accept documents
-         *  that have had their age field removed.
-         */
-        BSONObj redactSafePortion() const;
-
-    private:
-        DocumentSourceMatch(const BSONObj &query,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        scoped_ptr<Matcher> matcher;
-    };
-
-    class DocumentSourceMergeCursors :
-        public DocumentSource {
-    public:
-        typedef vector<pair<ConnectionString, CursorId> > CursorIds;
-
-        // virtuals from DocumentSource
-        boost::optional<Document> getNext();
-        virtual void setSource(DocumentSource *pSource);
-        virtual const char *getSourceName() const;
-        virtual void dispose();
-        virtual Value serialize(bool explain = false) const;
-        virtual bool isValidInitialSource() const { return true; }
-
-        static intrusive_ptr<DocumentSource> createFromBson(
-            BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        static intrusive_ptr<DocumentSource> create(
-            const CursorIds& cursorIds,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        static const char name[];
-
-        /** Returns non-owning pointers to cursors managed by this stage.
-         *  Call this instead of getNext() if you want access to the raw streams.
-         *  This method should only be called at most once.
-         */
-        vector<DBClientCursor*> getCursors();
-
-    private:
-
-        struct CursorAndConnection {
-            CursorAndConnection(ConnectionString host, NamespaceString ns, CursorId id);
-            ScopedDbConnection connection;
-            DBClientCursor cursor;
+        enum class ReturnStatus {
+            // There is a result to be processed.
+            kAdvanced,
+            // There will be no further results.
+            kEOF,
+            // There is not a result to be processed yet, but there may be more results in the
+            // future. If a DocumentSource retrieves this status from its child, it must propagate
+            // it without doing any further work.
+            kPauseExecution,
         };
 
-        // using list to enable removing arbitrary elements
-        typedef list<boost::shared_ptr<CursorAndConnection> > Cursors;
-
-        DocumentSourceMergeCursors(
-            const CursorIds& cursorIds,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        // Converts _cursorIds into active _cursors.
-        void start();
-
-        // This is the description of cursors to merge.
-        const CursorIds _cursorIds;
-
-        // These are the actual cursors we are merging. Created lazily.
-        Cursors _cursors;
-        Cursors::iterator _currentCursor;
-
-        bool _unstarted;
-    };
-
-    class DocumentSourceOut : public DocumentSource
-                            , public SplittableDocumentSource
-                            , public DocumentSourceNeedsMongod {
-    public:
-        // virtuals from DocumentSource
-        virtual ~DocumentSourceOut();
-        virtual boost::optional<Document> getNext();
-        virtual const char *getSourceName() const;
-        virtual Value serialize(bool explain = false) const;
-
-        // Virtuals for SplittableDocumentSource
-        virtual intrusive_ptr<DocumentSource> getShardSource() { return NULL; }
-        virtual intrusive_ptr<DocumentSource> getMergeSource() { return this; }
-
-        const NamespaceString& getOutputNs() const { return _outputNs; }
-
-        /**
-          Create a document source for output and pass-through.
-
-          This can be put anywhere in a pipeline and will store content as
-          well as pass it on.
-
-          @param pBsonElement the raw BSON specification for the source
-          @param pExpCtx the expression context for the pipeline
-          @returns the newly created document source
-        */
-        static intrusive_ptr<DocumentSource> createFromBson(
-            BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        static const char outName[];
-
-    private:
-        DocumentSourceOut(const NamespaceString& outputNs,
-                          const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        // Sets _tempsNs and prepares it to receive data.
-        void prepTempCollection();
-
-        void spill(DBClientBase* conn, const vector<BSONObj>& toInsert);
-
-        bool _done;
-
-        NamespaceString _tempNs; // output goes here as it is being processed.
-        const NamespaceString _outputNs; // output will go here after all data is processed.
-    };
-
-    
-    class DocumentSourceProject :
-        public DocumentSource {
-    public:
-        // virtuals from DocumentSource
-        virtual boost::optional<Document> getNext();
-        virtual const char *getSourceName() const;
-        virtual void optimize();
-        virtual Value serialize(bool explain = false) const;
-
-        virtual GetDepsReturn getDependencies(set<string>& deps) const;
-
-        /**
-          Create a new projection DocumentSource from BSON.
-
-          This is a convenience for directly handling BSON, and relies on the
-          above methods.
-
-          @param pBsonElement the BSONElement with an object named $project
-          @param pExpCtx the expression context for the pipeline
-          @returns the created projection
-         */
-        static intrusive_ptr<DocumentSource> createFromBson(
-            BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        static const char projectName[];
-
-        /** projection as specified by the user */
-        BSONObj getRaw() const { return _raw; }
-
-    private:
-        DocumentSourceProject(const intrusive_ptr<ExpressionContext>& pExpCtx,
-                              const intrusive_ptr<ExpressionObject>& exprObj);
-
-        // configuration state
-        intrusive_ptr<ExpressionObject> pEO;
-        BSONObj _raw;
-
-#if defined(_DEBUG)
-        // this is used in DEBUG builds to ensure we are compatible
-        Projection _simpleProjection;
-#endif
-    };
-
-    class DocumentSourceRedact :
-        public DocumentSource {
-    public:
-        virtual boost::optional<Document> getNext();
-        virtual const char* getSourceName() const;
-        virtual void optimize();
-
-        static const char redactName[];
-
-        static intrusive_ptr<DocumentSource> createFromBson(
-            BSONElement elem,
-            const intrusive_ptr<ExpressionContext>& expCtx);
-
-        virtual Value serialize(bool explain = false) const;
-
-    private:
-        DocumentSourceRedact(const intrusive_ptr<ExpressionContext>& expCtx,
-                             const intrusive_ptr<Expression>& previsit);
-        boost::optional<Document> redactObject(const Variables& in);
-        Value redactValue(const Variables& vars, const Value& in);
-
-        intrusive_ptr<Expression> _expression;
-    };
-
-    class DocumentSourceSort : public DocumentSource
-                             , public SplittableDocumentSource {
-    public:
-        // virtuals from DocumentSource
-        virtual boost::optional<Document> getNext();
-        virtual const char *getSourceName() const;
-        virtual void serializeToArray(vector<Value>& array, bool explain = false) const;
-        virtual bool coalesce(const intrusive_ptr<DocumentSource> &pNextSource);
-        virtual void dispose();
-
-        virtual GetDepsReturn getDependencies(set<string>& deps) const;
-
-        virtual intrusive_ptr<DocumentSource> getShardSource();
-        virtual intrusive_ptr<DocumentSource> getMergeSource();
-
-        /**
-          Add sort key field.
-
-          Adds a sort key field to the key being built up.  A concatenated
-          key is built up by calling this repeatedly.
-
-          @param fieldPath the field path to the key component
-          @param ascending if true, use the key for an ascending sort,
-            otherwise, use it for descending
-        */
-        void addKey(const string &fieldPath, bool ascending);
-
-        /// Write out a Document whose contents are the sort key.
-        Document serializeSortKey() const;
-
-        /**
-          Create a sorting DocumentSource from BSON.
-
-          This is a convenience method that uses the above, and operates on
-          a BSONElement that has been deteremined to be an Object with an
-          element named $group.
-
-          @param pBsonElement the BSONELement that defines the group
-          @param pExpCtx the expression context for the pipeline
-          @returns the grouping DocumentSource
-         */
-        static intrusive_ptr<DocumentSource> createFromBson(
-            BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        /// Create a DocumentSourceSort with a given sort and (optional) limit
-        static intrusive_ptr<DocumentSourceSort> create(
-            const intrusive_ptr<ExpressionContext> &pExpCtx,
-            BSONObj sortOrder,
-            long long limit=-1);
-
-        /// returns -1 for no limit
-        long long getLimit() const;
-
-        intrusive_ptr<DocumentSourceLimit> getLimitSrc() const { return limitSrc; }
-
-        static const char sortName[];
-
-    private:
-        DocumentSourceSort(const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        virtual Value serialize(bool explain = false) const {
-            verify(false); // should call addToBsonArray instead
+        static GetNextResult makeEOF() {
+            return GetNextResult(ReturnStatus::kEOF);
         }
 
-        /*
-          Before returning anything, this source must fetch everything from
-          the underlying source and group it.  populate() is used to do that
-          on the first call to any method on this source.  The populated
-          boolean indicates that this has been done.
+        static GetNextResult makePauseExecution() {
+            return GetNextResult(ReturnStatus::kPauseExecution);
+        }
+
+        /**
+         * Shortcut constructor for the common case of creating an 'advanced' GetNextResult from the
+         * given 'result'. Accepts only an rvalue reference as an argument, since DocumentSources
+         * will want to move 'result' into this GetNextResult, and should have to opt in to making a
+         * copy.
          */
-        void populate();
-        bool populated;
+        /* implicit */ GetNextResult(Document&& result)
+            : _status(ReturnStatus::kAdvanced), _result(std::move(result)) {}
 
-        SortOptions makeSortOptions() const;
+        /**
+         * Gets the result document. It is an error to call this if isAdvanced() returns false.
+         */
+        const Document& getDocument() const {
+            dassert(isAdvanced());
+            return _result;
+        }
 
-        // These are used to merge pre-sorted results from a DocumentSourceMergeCursors or a
-        // DocumentSourceCommandShards depending on whether we have finished upgrading to 2.6 or
-        // not.
-        class IteratorFromCursor;
-        class IteratorFromBsonArray;
-        void populateFromCursors(const vector<DBClientCursor*>& cursors);
-        void populateFromBsonArrays(const vector<BSONArray>& arrays);
+        /**
+         * Releases the result document, transferring ownership to the caller. It is an error to
+         * call this if isAdvanced() returns false.
+         */
+        Document releaseDocument() {
+            dassert(isAdvanced());
+            return std::move(_result);
+        }
 
-        /* these two parallel each other */
-        typedef vector<intrusive_ptr<ExpressionFieldPath> > SortPaths;
-        SortPaths vSortKey;
-        vector<char> vAscending; // used like vector<bool> but without specialization
+        ReturnStatus getStatus() const {
+            return _status;
+        }
 
-        /// Extracts the fields in vSortKey from the Document;
-        Value extractKey(const Document& d) const;
+        bool isAdvanced() const {
+            return _status == ReturnStatus::kAdvanced;
+        }
 
-        /// Compare two Values according to the specified sort key.
-        int compare(const Value& lhs, const Value& rhs) const;
+        bool isEOF() const {
+            return _status == ReturnStatus::kEOF;
+        }
 
-        typedef Sorter<Value, Document> MySorter;
+        bool isPaused() const {
+            return _status == ReturnStatus::kPauseExecution;
+        }
 
-        // For MySorter
-        class Comparator {
-        public:
-            explicit Comparator(const DocumentSourceSort& source): _source(source) {}
-            int operator()(const MySorter::Data& lhs, const MySorter::Data& rhs) const {
-                return _source.compare(lhs.first, rhs.first);
+    private:
+        GetNextResult(ReturnStatus status) : _status(status) {}
+
+        ReturnStatus _status;
+        Document _result;
+    };
+
+    /**
+     * A struct representing the information needed to execute this stage on a distributed
+     * collection. Describes how a pipeline should be split for sharded execution.
+     */
+    struct DistributedPlanLogic {
+        DistributedPlanLogic() = default;
+
+        /**
+         * Convenience constructor for the common case where there is at most one merging stage. Can
+         * pass nullptr for the merging stage which means "no merging required."
+         */
+        DistributedPlanLogic(boost::intrusive_ptr<DocumentSource> shardsStageIn,
+                             boost::intrusive_ptr<DocumentSource> mergeStage,
+                             boost::optional<BSONObj> mergeSortPatternIn = boost::none)
+            : shardsStage(std::move(shardsStageIn)),
+              mergeSortPattern(std::move(mergeSortPatternIn)) {
+            if (mergeStage) {
+                mergingStages.emplace_back(std::move(mergeStage));
             }
-        private:
-            const DocumentSourceSort& _source;
+        }
+
+        typedef std::function<bool(const DocumentSource&)> movePastFunctionType;
+        // A stage which executes on each shard in parallel, or nullptr if nothing can be done in
+        // parallel. For example, a partial $group before a subsequent global $group.
+        boost::intrusive_ptr<DocumentSource> shardsStage = nullptr;
+
+        // A stage or stages which function to merge all the results together, or an empty list if
+        // nothing is necessary after merging. For example, a $limit stage.
+        std::list<boost::intrusive_ptr<DocumentSource>> mergingStages = {};
+
+        // If set, each document is expected to have sort key metadata which will be serialized in
+        // the '$sortKey' field. 'mergeSortPattern' will then be used to describe which fields are
+        // ascending and which fields are descending when merging the streams together.
+        boost::optional<BSONObj> mergeSortPattern = boost::none;
+
+        // If mergeSortPattern is specified and needsSplit is false, the split point will be
+        // deferred to the next stage that would split the pipeline. The sortPattern will be taken
+        // into account at that split point. Should be true if a stage specifies 'shardsStage' or
+        // 'mergingStage'. Does not mean anything if the sort pattern is not set.
+        bool needsSplit = true;
+
+        // If needsSplit is false and this plan has anything that must run on the merging half of
+        // the pipeline, it will be deferred until the next stage that sets any non-default value on
+        // 'DistributedPlanLogic' or until a following stage causes the given validation
+        // function to return false. By default this will not allow swapping with any
+        // following stages.
+        movePastFunctionType canMovePast = [](const DocumentSource&) {
+            return false;
+        };
+    };
+
+    /**
+     * Describes context pipelineDependentDistributedPlanLogic() should take into account to make a
+     * decision about whether or not a document source can be pushed down to shards.
+     */
+    struct DistributedPlanContext {
+        // The pipeline up to but not including the current document source.
+        const Pipeline& pipelinePrefix;
+        // The pipeline after and not including the document source.
+        const Pipeline& pipelineSuffix;
+        // The set of paths provided by the shard key.
+        const boost::optional<OrderedPathSet>& shardKeyPaths;
+    };
+
+    ~DocumentSource() override {}
+
+    /**
+     * The stage spills its data and asks from all its children to spill their data as well.
+     */
+    void forceSpill() {
+        doForceSpill();
+        if (pSource) {
+            pSource->forceSpill();
+        }
+    }
+
+    /**
+     * Makes a deep clone of the DocumentSource by serializing and re-parsing it. DocumentSources
+     * that cannot be safely cloned this way should override this method. Callers can optionally
+     * specify 'newExpCtx' to construct the deep clone with it instead of defaulting to the
+     * original's 'ExpressionContext'.
+     */
+    virtual boost::intrusive_ptr<DocumentSource> clone(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx) const {
+        tassert(7406001, "expCtx passed to clone must not be null", expCtx);
+        std::vector<Value> serializedDoc;
+        serializeToArray(serializedDoc, SerializationOptions{.serializeForCloning = true});
+        tassert(5757900,
+                str::stream() << "DocumentSource " << getSourceName()
+                              << " should have serialized to exactly one document. This stage may "
+                                 "need a custom clone() implementation",
+                serializedDoc.size() == 1 && serializedDoc[0].getType() == BSONType::Object);
+        auto dsList = parse(expCtx, Document(serializedDoc[0].getDocument()).toBson());
+        // Cloning should only happen once the pipeline has been fully built, after desugaring from
+        // one stage to multiple stages has occurred. When cloning desugared stages we expect each
+        // stage to re-parse to one stage.
+        tassert(5757901,
+                str::stream() << "DocumentSource " << getSourceName()
+                              << " parse should have returned single document. This stage may need "
+                                 "a custom clone() implementation",
+                dsList.size() == 1);
+        return dsList.front();
+    }
+
+    /**
+     * The main execution API of a DocumentSource. Returns an intermediate query result generated by
+     * this DocumentSource.
+     *
+     * For performance reasons, a streaming stage must not keep references to documents across calls
+     * to getNext(). Such stages must retrieve a result from their child and then release it (or
+     * return it) before asking for another result. Failing to do so can result in extra work, since
+     * the Document/Value library must copy data on write when that data has a refcount above one.
+     */
+    GetNextResult getNext() {
+        pExpCtx->checkForInterrupt();
+
+        if (MONGO_likely(!pExpCtx->shouldCollectDocumentSourceExecStats())) {
+            return doGetNext();
+        }
+
+        auto serviceCtx = pExpCtx->getOperationContext()->getServiceContext();
+        dassert(serviceCtx);
+
+        auto timer = getOptTimer(serviceCtx);
+
+        ++_commonStats.works;
+
+        GetNextResult next = doGetNext();
+        if (next.isAdvanced()) {
+            ++_commonStats.advanced;
+        }
+        return next;
+    }
+
+    /**
+     * Returns a struct containing information about any special constraints imposed on using this
+     * stage. Input parameter Pipeline::SplitState is used by stages whose requirements change
+     * depending on whether they are in a split or unsplit pipeline.
+     */
+    virtual StageConstraints constraints(
+        Pipeline::SplitState = Pipeline::SplitState::kUnsplit) const = 0;
+
+    /**
+     * If a stage's StageConstraints::PositionRequirement is kCustom, then it should also override
+     * this method, which will be called by the validation process.
+     */
+    virtual void validatePipelinePosition(bool alreadyOptimized,
+                                          Pipeline::SourceContainer::const_iterator pos,
+                                          const Pipeline::SourceContainer& container) const {
+        MONGO_UNIMPLEMENTED_TASSERT(7183905);
+    };
+
+    /**
+     * Informs the stage that it is no longer needed and can release its resources. After dispose()
+     * is called the stage must still be able to handle calls to getNext(), but can return kEOF.
+     *
+     * This is a non-virtual public interface to ensure dispose() is threaded through the entire
+     * pipeline. Subclasses should override doDispose() to implement their disposal.
+     */
+    void dispose() {
+        doDispose();
+        if (pSource) {
+            pSource->dispose();
+        }
+    }
+
+    /**
+     * Get the CommonStats for this DocumentSource.
+     */
+    const CommonStats& getCommonStats() const {
+        return _commonStats;
+    }
+
+    /**
+     * Get the stats specific to the DocumentSource. It is legal for the DocumentSource to return
+     * nullptr to indicate that no specific stats are available.
+     */
+    virtual const SpecificStats* getSpecificStats() const {
+        return nullptr;
+    }
+
+    /**
+     * Get the stage's name.
+     */
+    virtual const char* getSourceName() const = 0;
+
+    /**
+     * Returns the DocumentSource::Id value of a given stage object.
+     * Each child class should override this and return that class's static `id` value.
+     */
+    virtual Id getId() const = 0;
+
+    /**
+     * Set the underlying source this source should use to get Documents from. Must not throw
+     * exceptions.
+     */
+    virtual void setSource(DocumentSource* source) {
+        pSource = source;
+    }
+
+    /**
+     * In the default case, serializes the DocumentSource and adds it to the std::vector<Value>.
+     *
+     * A subclass may choose to overwrite this, rather than serialize, if it should output multiple
+     * stages (eg, $sort sometimes also outputs a $limit).
+     */
+    virtual void serializeToArray(std::vector<Value>& array,
+                                  const SerializationOptions& opts = SerializationOptions{}) const;
+
+    /**
+     * Shortcut method to get a BSONObj for debugging. Often useful in log messages, but is not
+     * cheap so avoid doing so on a hot path at a low verbosity.
+     */
+    virtual BSONObj serializeToBSONForDebug() const;
+
+    /**
+     * If this stage uses additional namespaces, adds them to 'collectionNames'. These namespaces
+     * should all be names of collections, not views.
+     */
+    virtual void addInvolvedCollections(
+        stdx::unordered_set<NamespaceString>* collectionNames) const {}
+
+    virtual void detachFromOperationContext() {}
+
+    virtual void reattachToOperationContext(OperationContext* opCtx) {}
+
+    /**
+     * Validate that all operation contexts associated with this document source, including any
+     * subpipelines, match the argument.
+     */
+    virtual bool validateOperationContext(const OperationContext* opCtx) const {
+        return getContext()->getOperationContext() == opCtx;
+    }
+
+    virtual bool usedDisk() {
+        return false;
+    }
+
+    /**
+     * Create a DocumentSource pipeline stage from 'stageObj'.
+     */
+    static std::list<boost::intrusive_ptr<DocumentSource>> parse(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx, BSONObj stageObj);
+
+    /**
+     * Function that will be used as an alternate parser for a document source that has been
+     * disabled.
+     */
+    static boost::intrusive_ptr<DocumentSource> parseDisabled(
+        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+        uasserted(
+            ErrorCodes::QueryFeatureNotAllowed,
+            str::stream() << elem.fieldName()
+                          << " is not allowed with the current configuration. You may need to "
+                             "enable the corresponding feature flag");
+    }
+    /**
+     * Registers a DocumentSource with a parsing function, so that when a stage with the given name
+     * is encountered, it will call 'parser' to construct that stage.
+     *
+     * DO NOT call this method directly. Instead, use the REGISTER_DOCUMENT_SOURCE macro defined in
+     * this file.
+     */
+    static void registerParser(std::string name,
+                               Parser parser,
+                               boost::optional<FeatureFlag> featureFlag);
+    /**
+     * Convenience wrapper for the common case, when DocumentSource::Parser returns a list of one
+     * DocumentSource.
+     *
+     * DO NOT call this method directly. Instead, use the REGISTER_DOCUMENT_SOURCE macro defined in
+     * this file.
+     */
+    static void registerParser(std::string name,
+                               SimpleParser simpleParser,
+                               boost::optional<FeatureFlag> featureFlag);
+
+    /**
+     * Allocate and return a new, unique DocumentSource::Id value.
+     *
+     * DO NOT call this method directly. Instead, use the ALLOCATE_DOCUMENT_SOURCE_ID macro defined
+     * in this file.
+     */
+    static Id allocateId(StringData name);
+
+    /**
+     * Returns true if the DocumentSource has a query.
+     */
+    virtual bool hasQuery() const;
+
+    /**
+     * Returns the DocumentSource query if it exists.
+     */
+    virtual BSONObj getQuery() const;
+
+    /**
+     * Utility which allows for accessing and computing a ShardId to act as a merger.
+     */
+    boost::optional<ShardId> getMergeShardId() const {
+        return mergeShardId.get();
+    }
+
+private:
+    /**
+     * itr is pointing to some stage `A`. Fetch stage `B`, the stage after A in itr. If B is a
+     * $match stage, attempt to push B before A. Returns whether this optimization was
+     * performed.
+     */
+    bool pushMatchBefore(Pipeline::SourceContainer::iterator itr,
+                         Pipeline::SourceContainer* container);
+
+    /**
+     * itr is pointing to some stage `A`. Fetch stage `B`, the stage after A in itr. If B is a
+     * $sample stage, attempt to push B before A. Returns whether this optimization was
+     * performed.
+     */
+    bool pushSampleBefore(Pipeline::SourceContainer::iterator itr,
+                          Pipeline::SourceContainer* container);
+
+    /**
+     * Attempts to push any kind of 'DocumentSourceSingleDocumentTransformation' stage or a $redact
+     * stage directly ahead of the stage present at the 'itr' position if matches the constraints.
+     * Returns true if optimization was performed, false otherwise.
+     *
+     * Note that this optimization is oblivious to the transform function. The only stages that are
+     * eligible to swap are those that can safely swap with any transform.
+     */
+    bool pushSingleDocumentTransformOrRedactBefore(Pipeline::SourceContainer::iterator itr,
+                                                   Pipeline::SourceContainer* container);
+
+    /**
+     * Wraps various optimization methods and returns the call immediately if any one of them
+     * returns true.
+     */
+    bool attemptToPushStageBefore(Pipeline::SourceContainer::iterator itr,
+                                  Pipeline::SourceContainer* container) {
+        if (std::next(itr) == container->end()) {
+            return false;
+        }
+
+        return pushMatchBefore(itr, container) || pushSampleBefore(itr, container) ||
+            pushSingleDocumentTransformOrRedactBefore(itr, container);
+    }
+
+    /**
+     * Returns an optional timer which is used to collect the execution time.
+     * May return boost::none if it is not necessary to collect timing info.
+     */
+    boost::optional<ScopedTimer> getOptTimer(ServiceContext* serviceCtx) {
+        if (serviceCtx &&
+            _commonStats.executionTime.precision != QueryExecTimerPrecision::kNoTiming) {
+            if (MONGO_likely(_commonStats.executionTime.precision ==
+                             QueryExecTimerPrecision::kMillis)) {
+                return boost::optional<ScopedTimer>(
+                    boost::in_place_init,
+                    &_commonStats.executionTime.executionTimeEstimate,
+                    serviceCtx->getFastClockSource());
+            } else {
+                return boost::optional<ScopedTimer>(
+                    boost::in_place_init,
+                    &_commonStats.executionTime.executionTimeEstimate,
+                    serviceCtx->getTickSource());
+            }
+        }
+        return boost::none;
+    }
+
+public:
+    /**
+     * The non-virtual public interface for optimization. Attempts to do some generic optimizations
+     * such as pushing $matches as early in the pipeline as possible, then calls out to
+     * doOptimizeAt() for stage-specific optimizations.
+     *
+     * Subclasses should override doOptimizeAt() if they can apply some optimization(s) based on
+     * subsequent stages in the pipeline.
+     */
+    Pipeline::SourceContainer::iterator optimizeAt(Pipeline::SourceContainer::iterator itr,
+                                                   Pipeline::SourceContainer* container);
+
+    /**
+     * Returns an optimized DocumentSource that is semantically equivalent to this one, or
+     * nullptr if this stage is a no-op. Implementations are allowed to modify themselves
+     * in-place and return a pointer to themselves. For best results, first optimize the pipeline
+     * with the optimizePipeline() method defined in pipeline.cpp.
+     *
+     * This is intended for any operations that include expressions, and provides a hook for
+     * those to optimize those operations.
+     *
+     * The default implementation is to do nothing and return yourself.
+     */
+    virtual boost::intrusive_ptr<DocumentSource> optimize();
+
+    //
+    // Property Analysis - These methods allow a DocumentSource to expose information about
+    // properties of themselves, such as which fields they need to apply their transformations, and
+    // whether or not they produce or preserve a sort order.
+    //
+    // Property analysis can be useful during optimization (e.g. analysis of sort orders determines
+    // whether or not a blocking group can be upgraded to a streaming group).
+    //
+
+    struct GetModPathsReturn {
+        // Note that renaming a path does NOT count as a modification (see `renames` struct member).
+        // Modification can be, in the context of the query: the removal of a path, the creation of
+        // a new path, etc.
+        enum class Type {
+            // No information is available about which paths are modified.
+            kNotSupported,
+
+            // All fields will be modified. This should be used by stages like $replaceRoot which
+            // modify the entire document.
+            kAllPaths,
+
+            // A finite set of paths will be modified by this stage. This is true for something like
+            // {$project: {a: 0, b: 0}}, which will only modify 'a' and 'b', and leave all other
+            // paths unmodified. Other examples include: $lookup, $unwind.
+            kFiniteSet,
+
+            // This stage will modify an infinite set of paths, but we know which paths it will not
+            // modify. For example, the stage {$project: {_id: 1, a: 1}} will leave only the fields
+            // '_id' and 'a' unmodified, but all other fields will be projected out. Other examples
+            // include: $group.
+            kAllExcept,
         };
 
-        intrusive_ptr<DocumentSourceLimit> limitSrc;
+        GetModPathsReturn(Type type,
+                          OrderedPathSet&& paths,
+                          StringMap<std::string>&& renames,
+                          StringMap<std::string>&& complexRenames = {})
+            : type(type),
+              paths(std::move(paths)),
+              renames(std::move(renames)),
+              complexRenames(std::move(complexRenames)) {}
 
-        bool _done;
-        bool _mergingPresorted;
-        scoped_ptr<MySorter::Iterator> _output;
-    };
-
-    class DocumentSourceLimit : public DocumentSource
-                              , public SplittableDocumentSource {
-    public:
-        // virtuals from DocumentSource
-        virtual boost::optional<Document> getNext();
-        virtual const char *getSourceName() const;
-        virtual bool coalesce(const intrusive_ptr<DocumentSource> &pNextSource);
-        virtual Value serialize(bool explain = false) const;
-
-        virtual GetDepsReturn getDependencies(set<string>& deps) const {
-            return SEE_NEXT; // This doesn't affect needed fields
+        std::set<std::string> getNewNames() {
+            std::set<std::string> newNames;
+            for (auto&& name : paths) {
+                newNames.insert(name);
+            }
+            for (auto&& rename : renames) {
+                newNames.insert(rename.first);
+            }
+            return newNames;
         }
 
-        /**
-          Create a new limiting DocumentSource.
+        bool canModify(const FieldPath& fieldPath) const {
+            switch (type) {
+                case Type::kAllPaths:
+                    return true;
+                case Type::kNotSupported:
+                    return true;
+                case Type::kFiniteSet:
+                    // If there's a subpath that is modified this path may be modified.
+                    for (size_t i = 0; i < fieldPath.getPathLength(); i++) {
+                        if (paths.count(fieldPath.getSubpath(i).toString()))
+                            return true;
+                    }
 
-          @param pExpCtx the expression context for the pipeline
-          @returns the DocumentSource
-         */
-        static intrusive_ptr<DocumentSourceLimit> create(
-            const intrusive_ptr<ExpressionContext> &pExpCtx,
-            long long limit);
+                    for (auto&& path : paths) {
+                        // If there's a superpath that is modified this path may be modified.
+                        if (expression::isPathPrefixOf(fieldPath.fullPath(), path)) {
+                            return true;
+                        }
+                    }
 
-        // Virtuals for SplittableDocumentSource
-        // Need to run on rounter. Running on shard as well is an optimization.
-        virtual intrusive_ptr<DocumentSource> getShardSource() { return this; }
-        virtual intrusive_ptr<DocumentSource> getMergeSource() { return this; }
+                    return false;
+                case Type::kAllExcept:
+                    // If one of the subpaths is unmodified return false.
+                    for (size_t i = 0; i < fieldPath.getPathLength(); i++) {
+                        if (paths.count(fieldPath.getSubpath(i).toString()))
+                            return false;
+                    }
 
-        long long getLimit() const { return limit; }
-        void setLimit(long long newLimit) { limit = newLimit; }
-
-        /**
-          Create a limiting DocumentSource from BSON.
-
-          This is a convenience method that uses the above, and operates on
-          a BSONElement that has been deteremined to be an Object with an
-          element named $limit.
-
-          @param pBsonElement the BSONELement that defines the limit
-          @param pExpCtx the expression context
-          @returns the grouping DocumentSource
-         */
-        static intrusive_ptr<DocumentSource> createFromBson(
-            BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        static const char limitName[];
-
-    private:
-        DocumentSourceLimit(const intrusive_ptr<ExpressionContext> &pExpCtx,
-                            long long limit);
-
-        long long limit;
-        long long count;
-    };
-
-    class DocumentSourceSkip : public DocumentSource
-                             , public SplittableDocumentSource {
-    public:
-        // virtuals from DocumentSource
-        virtual boost::optional<Document> getNext();
-        virtual const char *getSourceName() const;
-        virtual bool coalesce(const intrusive_ptr<DocumentSource> &pNextSource);
-        virtual Value serialize(bool explain = false) const;
-
-        virtual GetDepsReturn getDependencies(set<string>& deps) const {
-            return SEE_NEXT; // This doesn't affect needed fields
+                    // Otherwise return true;
+                    return true;
+            }
+            // Cannot hit.
+            MONGO_UNREACHABLE_TASSERT(6434902);
         }
 
-        /**
-          Create a new skipping DocumentSource.
+        Type type;
+        OrderedPathSet paths;
 
-          @param pExpCtx the expression context
-          @returns the DocumentSource
-         */
-        static intrusive_ptr<DocumentSourceSkip> create(
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
+        // Stages may fill out 'renames' to contain information about path renames. Each entry in
+        // 'renames' maps from the new name of the path (valid in documents flowing *out* of this
+        // stage) to the old name of the path (valid in documents flowing *into* this stage).
+        //
+        // For example, consider the stage
+        //
+        //   {$project: {_id: 0, a: 1, b: "$c"}}
+        //
+        // This stage should return kAllExcept, since it modifies all paths other than "a". It can
+        // also fill out 'renames' with the mapping "b" => "c".
+        StringMap<std::string> renames;
 
-        // Virtuals for SplittableDocumentSource
-        // Need to run on rounter. Can't run on shards.
-        virtual intrusive_ptr<DocumentSource> getShardSource() { return NULL; }
-        virtual intrusive_ptr<DocumentSource> getMergeSource() { return this; }
-
-        long long getSkip() const { return _skip; }
-        void setSkip(long long newSkip) { _skip = newSkip; }
-
-        /**
-          Create a skipping DocumentSource from BSON.
-
-          This is a convenience method that uses the above, and operates on
-          a BSONElement that has been deteremined to be an Object with an
-          element named $skip.
-
-          @param pBsonElement the BSONELement that defines the skip
-          @param pExpCtx the expression context
-          @returns the grouping DocumentSource
-         */
-        static intrusive_ptr<DocumentSource> createFromBson(
-            BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        static const char skipName[];
-
-    private:
-        DocumentSourceSkip(const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        long long _skip;
-        bool _needToSkip;
+        // Including space for returning renames which include dotted paths.
+        // i.e., "a.b" => c
+        //
+        StringMap<std::string> complexRenames;
     };
 
-
-    class DocumentSourceUnwind :
-        public DocumentSource {
-    public:
-        // virtuals from DocumentSource
-        virtual boost::optional<Document> getNext();
-        virtual const char *getSourceName() const;
-        virtual Value serialize(bool explain = false) const;
-
-        virtual GetDepsReturn getDependencies(set<string>& deps) const;
-
-        /**
-          Create a new projection DocumentSource from BSON.
-
-          This is a convenience for directly handling BSON, and relies on the
-          above methods.
-
-          @param pBsonElement the BSONElement with an object named $project
-          @param pExpCtx the expression context for the pipeline
-          @returns the created projection
-         */
-        static intrusive_ptr<DocumentSource> createFromBson(
-            BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        static const char unwindName[];
-
-    private:
-        DocumentSourceUnwind(const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        /** Specify the field to unwind. */
-        void unwindPath(const FieldPath &fieldPath);
-
-        // Configuration state.
-        scoped_ptr<FieldPath> _unwindPath;
-
-        // Iteration state.
-        class Unwinder;
-        scoped_ptr<Unwinder> _unwinder;
-    };
-
-    class DocumentSourceGeoNear : public DocumentSource
-                                , public SplittableDocumentSource
-                                , public DocumentSourceNeedsMongod {
-    public:
-        // virtuals from DocumentSource
-        virtual boost::optional<Document> getNext();
-        virtual const char *getSourceName() const;
-        virtual void setSource(DocumentSource *pSource); // errors out since this must be first
-        virtual bool coalesce(const intrusive_ptr<DocumentSource> &pNextSource);
-        virtual bool isValidInitialSource() const { return true; }
-        virtual Value serialize(bool explain = false) const;
-
-        // Virtuals for SplittableDocumentSource
-        virtual intrusive_ptr<DocumentSource> getShardSource();
-        virtual intrusive_ptr<DocumentSource> getMergeSource();
-
-        static intrusive_ptr<DocumentSource> createFromBson(
-            BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pCtx);
-
-        static char geoNearName[];
-
-        long long getLimit() { return limit; }
-
-        // this should only be used for testing
-        static intrusive_ptr<DocumentSourceGeoNear> create(
-            const intrusive_ptr<ExpressionContext> &pCtx);
-
-    private:
-        DocumentSourceGeoNear(const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        void parseOptions(BSONObj options);
-        BSONObj buildGeoNearCmd() const;
-        void runCommand();
-
-        // These fields describe the command to run.
-        // coords and distanceField are required, rest are optional
-        BSONObj coords; // "near" option, but near is a reserved keyword on windows
-        bool coordsIsArray;
-        scoped_ptr<FieldPath> distanceField; // Using scoped_ptr because FieldPath can't be empty
-        long long limit;
-        double maxDistance;
-        BSONObj query;
-        bool spherical;
-        double distanceMultiplier;
-        scoped_ptr<FieldPath> includeLocs;
-        bool uniqueDocs;
-
-        // these fields are used while processing the results
-        BSONObj cmdOutput;
-        boost::scoped_ptr<BSONObjIterator> resultsIterator; // iterator over cmdOutput["results"]
-    };
-}
-
-
-/* ======================= INLINED IMPLEMENTATIONS ========================== */
-
-namespace mongo {
-    inline void DocumentSourceGroup::setIdExpression(
-        const intrusive_ptr<Expression> &pExpression) {
-        pIdExpression = pExpression;
+    /**
+     * Returns information about which paths are added, removed, or updated by this stage. The
+     * default implementation uses kNotSupported to indicate that the set of modified paths for this
+     * stage is not known.
+     *
+     * See GetModPathsReturn above for the possible return values and what they mean.
+     */
+    virtual GetModPathsReturn getModifiedPaths() const {
+        return {GetModPathsReturn::Type::kNotSupported, OrderedPathSet{}, {}};
     }
-}
+
+    /**
+     * Returns the expression context from the stage's context.
+     */
+    const boost::intrusive_ptr<ExpressionContext>& getContext() const {
+        return pExpCtx;
+    }
+
+    /**
+     * Get the dependencies this operation needs to do its job. If overridden, subclasses must add
+     * all paths needed to apply their transformation to 'deps->fields', and call
+     * 'deps->setNeedsMetadata()' to indicate what metadata (e.g. text score), if any, is required.
+     *
+     * See DepsTracker::State for the possible return values and what they mean.
+     */
+    virtual DepsTracker::State getDependencies(DepsTracker* deps) const {
+        return DepsTracker::State::NOT_SUPPORTED;
+    }
+
+    /**
+     * Populate 'refs' with the variables referred to by this stage, including user and system
+     * variables but excluding $$ROOT. Note that field path references are not considered variables.
+     */
+    virtual void addVariableRefs(std::set<Variables::Id>* refs) const = 0;
+
+    /**
+     * If this stage can be run in parallel across a distributed collection, returns boost::none.
+     * Otherwise, returns a struct representing what needs to be done to merge each shard's pipeline
+     * into a single stream of results. Must not mutate the existing source object; if different
+     * behaviour is required, a new source should be created and configured appropriately. It is an
+     * error for the returned DistributedPlanLogic to have identical pointers for 'shardsStage' and
+     * 'mergingStage'.
+     */
+    virtual boost::optional<DistributedPlanLogic> distributedPlanLogic() = 0;
+
+    /**
+     * Check if a source is able to run in parallel across a distributed collection, given
+     * sharding context and that it will be evaluated _after_ pipelinePrefix, and _before_
+     * pipelineSuffix.
+     *
+     * For stages which do not have any pipeline-dependent behaviour, the default impl
+     * calls distributedPlanLogic.
+     *
+     * See distributedPlanLogic() for conditions and return values.
+     */
+    virtual boost::optional<DistributedPlanLogic> pipelineDependentDistributedPlanLogic(
+        const DistributedPlanContext& ctx) {
+        return distributedPlanLogic();
+    }
+
+    /**
+     * Returns true if it would be correct to execute this stage in parallel across the shards in
+     * cases where the final stage is a stage which can perform a write operation, such as $merge.
+     * For example, a $group stage which is just merging the groups from the shards can be run in
+     * parallel since it will preserve the shard key.
+     */
+    virtual bool canRunInParallelBeforeWriteStage(
+        const OrderedPathSet& nameOfShardKeyFieldsUponEntryToStage) const {
+        return false;
+    }
+
+    /**
+     * For stages that have sub-pipelines returns the source container holding the stages of that
+     * pipeline. Otherwise returns a nullptr.
+     */
+    virtual const Pipeline::SourceContainer* getSubPipeline() const {
+        return nullptr;
+    }
+
+protected:
+    DocumentSource(StringData stageName, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+    /**
+     * The main execution API of a DocumentSource. Returns an intermediate query result generated by
+     * this DocumentSource. See comment at getNext().
+     */
+    virtual GetNextResult doGetNext() = 0;
+
+    /**
+     * Attempt to perform an optimization with the following source in the pipeline. 'container'
+     * refers to the entire pipeline, and 'itr' points to this stage within the pipeline.
+     *
+     * The return value is an iterator over the same container which points to the first location
+     * in the container at which an optimization may be possible, or the end of the container().
+     *
+     * For example, if a swap takes place, the returned iterator should just be the position
+     * directly preceding 'itr', if such a position exists, since the stage at that position may be
+     * able to perform further optimizations with its new neighbor.
+     */
+    virtual Pipeline::SourceContainer::iterator doOptimizeAt(
+        Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
+        return std::next(itr);
+    };
+
+    /**
+     * Release any resources held by this stage. After doDispose() is called the stage must still be
+     * able to handle calls to getNext(), but can return kEOF.
+     */
+    virtual void doDispose() {}
+
+    /**
+     * Utility which describes when a stage needs to nominate a merging shard.
+     */
+    virtual boost::optional<ShardId> computeMergeShardId() const {
+        return boost::none;
+    }
+
+    /*
+      Most DocumentSources have an underlying source they get their data
+      from.  This is a convenience for them.
+
+      The default implementation of setSource() sets this; if you don't
+      need a source, override that to verify().  The default is to
+      verify() if this has already been set.
+    */
+    DocumentSource* pSource;
+
+    boost::intrusive_ptr<ExpressionContext> pExpCtx;
+
+    /**
+     * Tracks this stage's merge ShardId, if one exists.
+     */
+    DeferredFn<boost::optional<ShardId>> mergeShardId{[this]() -> boost::optional<ShardId> {
+        auto shardId = this->computeMergeShardId();
+        tassert(9514400,
+                str::stream() << "ShardId must be either boost::none or valid, but got "
+                              << (shardId ? shardId->toString() : "boost::none"),
+                !shardId || shardId->isValid());
+        return shardId;
+    }};
+
+private:
+    // Give access to 'parserMap' for the implementation of $listMqlEntities but hiding 'parserMap'
+    // from all other DocumentSource implementations.
+    friend class DocumentSourceListMqlEntities;
+
+    // Used to keep track of which DocumentSources are registered under which name. Initialized
+    // during process initialization and const thereafter.
+    static StringMap<ParserRegistration> parserMap;
+
+    CommonStats _commonStats;
+
+    /**
+     * Create a Value that represents the document source.
+     *
+     * This is used by the default implementation of serializeToArray() to add this object
+     * to a pipeline being serialized. Returning a missing() Value results in no entry
+     * being added to the array for this stage (DocumentSource).
+     */
+    virtual Value serialize(const SerializationOptions& opts = SerializationOptions{}) const = 0;
+
+    /**
+     * Spills the stage's data to disk. Stages that can spill their own data need to override this
+     * method.
+     */
+    virtual void doForceSpill() {}
+};
+
+/**
+ * Method to accumulate the plan summary stats from all stages of the pipeline into the given
+ * `planSummaryStats` object.
+ */
+void accumulatePipelinePlanSummaryStats(const Pipeline& pipeline,
+                                        PlanSummaryStats& planSummaryStats);
+
+}  // namespace mongo

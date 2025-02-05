@@ -1,74 +1,73 @@
-/*    Copyright 2012 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
-#include <iosfwd>
-#include <string>
-
-#include "mongo/base/string_data.h"
+#include "mongo/db/auth/auth_name.h"
 
 namespace mongo {
 
-    /**
-     * Representation of a name of a principal (authenticatable user) in a MongoDB system.
-     *
-     * Consists of a "user name" part, and a "database name" part.
-     */
-    class UserName {
-    public:
-        UserName() : _splitPoint(0) {}
-        UserName(const StringData& user, const StringData& dbname);
+class UserName : public AuthName<UserName> {
+public:
+    static constexpr auto kName = "UserName"_sd;
+    static constexpr auto kFieldName = "user"_sd;
 
-        /**
-         * Gets the user part of a UserName.
-         */
-        StringData getUser() const { return StringData(_fullName).substr(0, _splitPoint); }
+    using AuthName::AuthName;
 
-        /**
-         * Gets the database name part of a UserName.
-         */
-        StringData getDB() const { return StringData(_fullName).substr(_splitPoint + 1); }
-
-        /**
-         * Gets the full unique name of a user as a string, formatted as "user@db".
-         */
-        const std::string& getFullName() const { return _fullName; }
-
-        /**
-         * Stringifies the object, for logging/debugging.
-         */
-        std::string toString() const { return getFullName(); }
-
-    private:
-        std::string _fullName;  // The full name, stored as a string.  "user@db".
-        size_t _splitPoint;  // The index of the "@" separating the user and db name parts.
-    };
-
-    static inline bool operator==(const UserName& lhs, const UserName& rhs) {
-        return lhs.getFullName() == rhs.getFullName();
+    const std::string& getUser() const {
+        return getName();
     }
+};
 
-    static inline bool operator!=(const UserName& lhs, const UserName& rhs) {
-        return lhs.getFullName() != rhs.getFullName();
+using UserNameIterator = AuthNameIterator<UserName>;
+template <typename Container>
+using UserNameContainerIteratorImpl = AuthNameContainerIteratorImpl<Container, UserName>;
+
+template <typename ContainerIterator>
+UserNameIterator makeUserNameIterator(const ContainerIterator& begin,
+                                      const ContainerIterator& end) {
+    return UserNameIterator(
+        std::make_unique<UserNameContainerIteratorImpl<ContainerIterator>>(begin, end));
+}
+
+template <typename Container>
+UserNameIterator makeUserNameIteratorForContainer(const Container& container) {
+    return makeUserNameIterator(container.begin(), container.end());
+}
+
+template <typename Container>
+Container userNameIteratorToContainer(UserNameIterator it) {
+    Container container;
+    while (it.more()) {
+        container.emplace_back(it.next());
     }
-
-    static inline bool operator<(const UserName& lhs, const UserName& rhs) {
-        return lhs.getFullName() < rhs.getFullName();
-    }
-
-    std::ostream& operator<<(std::ostream& os, const UserName& name);
+    return container;
+}
 
 }  // namespace mongo

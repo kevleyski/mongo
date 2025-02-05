@@ -1,42 +1,46 @@
 // Tests whether new sharding is detected on insert by mongos
+// @tags: [
+//   # TODO (SERVER-97257): Re-enable this test.
+//   # Test doesn't start enough mongods to have num_mongos routers
+//   embedded_router_incompatible,
+// ]
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-var st = new ShardingTest( name = "test", shards = 1, verbose = 2, mongos = 2, other = { separateConfig : true } )
+var st = new ShardingTest({name: "mongos_no_detect_sharding", shards: 1, mongos: 2});
 
-var mongos = st.s
-var config = mongos.getDB("config")
+var mongos = st.s;
+var config = mongos.getDB("config");
 
-config.settings.update({ _id : "balancer" }, { $set : { stopped : true } }, true )
+print("Creating unsharded connection...");
 
+var mongos2 = st._mongos[1];
 
-print( "Creating unsharded connection..." )
+var coll = mongos2.getCollection("test.foo");
+assert.commandWorked(coll.insert({i: 0}));
 
+print("Sharding collection...");
 
-var mongos2 = st._mongos[1]
+var admin = mongos.getDB("admin");
 
-var coll = mongos2.getCollection( "test.foo" )
-coll.insert({ i : 0 })
+assert(!FixtureHelpers.isSharded(coll));
 
-print( "Sharding collection..." )
+admin.runCommand({enableSharding: "test"});
+admin.runCommand({shardCollection: "test.foo", key: {_id: 1}});
 
-var admin = mongos.getDB("admin")
-
-assert.eq( coll.getShardVersion().ok, 0 )
-
-admin.runCommand({ enableSharding : "test" })
-admin.runCommand({ shardCollection : "test.foo", key : { _id : 1 } })
-
-print( "Seeing if data gets inserted unsharded..." )
-print( "No splits occur here!" )
+print("Seeing if data gets inserted unsharded...");
+print("No splits occur here!");
 
 // Insert a bunch of data which should trigger a split
-for( var i = 0; i < 100; i++ ){
-    coll.insert({ i : i + 1 })
+var bulk = coll.initializeUnorderedBulkOp();
+for (var i = 0; i < 100; i++) {
+    bulk.insert({i: i + 1});
 }
-coll.getDB().getLastError()
+assert.commandWorked(bulk.execute());
 
-config.printShardingStatus( true )
+st.printShardingStatus(true);
 
-assert.eq( coll.getShardVersion().ok, 1 )
-assert.eq( 101, coll.find().itcount() )
+assert(FixtureHelpers.isSharded(coll));
+assert.eq(101, coll.find().itcount());
 
-st.stop()
+st.stop();

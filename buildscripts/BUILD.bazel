@@ -1,0 +1,196 @@
+load("@poetry//:dependencies.bzl", "dependency")
+
+exports_files([
+    "cheetah_source_generator.py",
+    "clang_tidy_config_gen.py",
+])
+
+py_binary(
+    name = "codeowners",
+    srcs = [
+        "codeowners_generate.py",
+        "download_codeowners_validator.py",
+        "validate_codeowners.py",
+    ],
+    main = "codeowners_generate.py",
+    visibility = ["//visibility:public"],
+    deps = [
+        dependency(
+            "pyyaml",
+            group = "core",
+        ),
+        dependency(
+            "typer",
+            group = "core",
+        ),
+    ],
+)
+
+py_binary(
+    name = "download_codeowners_validator",
+    srcs = ["download_codeowners_validator.py"],
+    main = "download_codeowners_validator.py",
+    visibility = ["//visibility:public"],
+    deps = [
+        dependency(
+            "typer",
+            group = "core",
+        ),
+    ],
+)
+
+py_binary(
+    name = "validate_codeowners",
+    srcs = [
+        "download_codeowners_validator.py",
+        "validate_codeowners.py",
+    ],
+    data = [
+        "//.github:CODEOWNERS",
+    ],
+    main = "validate_codeowners.py",
+    visibility = ["//visibility:public"],
+    deps = [
+        dependency(
+            "typer",
+            group = "core",
+        ),
+    ],
+)
+
+py_binary(
+    name = "simple_report",
+    srcs = ["simple_report.py"],
+    main = "simple_report.py",
+    visibility = ["//visibility:public"],
+    deps = [
+        dependency(
+            "click",
+            group = "evergreen",
+        ),
+    ],
+)
+
+py_binary(
+    name = "mongosymb",
+    srcs = [
+        "build_system_options.py",
+        "mongosymb.py",
+    ],
+    main = "mongosymb.py",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/util",
+        dependency(
+            "requests",
+            group = "core",
+        ),
+        dependency(
+            "tenacity",
+            group = "core",
+        ),
+    ],
+)
+
+py_binary(
+    name = "resmoke",
+    srcs = ["resmoke.py"],
+    main = "resmoke.py",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+        dependency(
+            "typer",
+            group = "core",
+        ),
+    ],
+)
+
+py_binary(
+    name = "engflow_auth",
+    srcs = ["engflow_auth.py"],
+    main = "engflow_auth.py",
+    visibility = ["//visibility:public"],
+    deps = [
+        dependency(
+            "retry",
+            group = "testing",
+        ),
+    ],
+)
+
+py_library(
+    name = "install_bazel",
+    srcs = [
+        "install_bazel.py",
+    ],
+    deps = [
+        dependency(
+            "retry",
+            group = "testing",
+        ),
+    ],
+)
+
+py_library(
+    name = "unittest_grouper",
+    srcs = [
+        "unittest_grouper.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "install_bazel",
+        dependency(
+            "typing-extensions",
+            group = "core",
+        ),
+    ],
+)
+
+py_library(
+    name = "download_buildifier",
+    srcs = [
+        "download_buildifier.py",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+py_binary(
+    name = "buildifier",
+    srcs = [
+        "buildifier.py",
+    ],
+    main = "buildifier.py",
+    visibility = ["//visibility:public"],
+    deps = [
+        "download_buildifier",
+        "simple_report",
+        "unittest_grouper",
+    ],
+)
+
+py_binary(
+    name = "legacy_commands_check",
+    srcs = [
+        "legacy_commands_check.py",
+        "moduleconfig.py",
+    ],
+    main = "legacy_commands_check.py",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/linter",
+        "//buildscripts/patch_builds",
+    ],
+)
+
+sh_binary(
+    name = "shellscripts_linters",
+    srcs = ["shellscripts-linters.sh"],
+    data = [
+        "@shfmt",
+    ],
+    env = {
+        "SHFMT_PATH": "$(execpath @shfmt//:shfmt)",
+    },
+    visibility = ["//visibility:public"],
+)

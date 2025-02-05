@@ -1,86 +1,74 @@
-doTest = function( signal ) {
+// Check that buildIndexes config option is working
 
-  var name = "buildIndexes";
-  var host = getHostName();
-  
-  var replTest = new ReplSetTest( {name: name, nodes: 3} );
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-  var nodes = replTest.startSet();
+// Skip db hash check because secondary will have different number of indexes due to
+// buildIndexes=false on the secondary.
+TestData.skipCheckDBHashes = true;
+var name = "buildIndexes";
+var host = getHostName();
 
-  var config = replTest.getReplSetConfig();
-  config.members[2].priority = 0;
-  config.members[2].buildIndexes = false;
-  
-  replTest.initiate(config);
+var replTest = new ReplSetTest({name: name, nodes: 3});
 
-  var master = replTest.getMaster().getDB(name);
-  var slaveConns = replTest.liveNodes.slaves;
-  var slave = [];
-  for (var i in slaveConns) {
-    slaveConns[i].setSlaveOk();
-    slave.push(slaveConns[i].getDB(name));
-  }
-  replTest.awaitReplication();
+var nodes = replTest.startSet();
 
-  print("creating an index on x");
-  master.x.ensureIndex({y : 1});
-  printjson(master.x.stats());
+var config = replTest.getReplSetConfig();
+config.members[2].priority = 0;
+config.members[2].buildIndexes = false;
 
-  for (var i=0; i<100; i++) {
-    master.x.insert({x:1,y:"abc",c:1});
-  }
+replTest.initiate(config);
 
-  replTest.awaitReplication();
+var primary = replTest.getPrimary().getDB(name);
+var secondaryConns = replTest.getSecondaries();
+var secondaries = [];
+for (var i in secondaryConns) {
+    secondaryConns[i].setSecondaryOk();
+    secondaries.push(secondaryConns[i].getDB(name));
+}
+replTest.awaitReplication();
 
-  printjson(slave[0].runCommand({count: "x"}));
-  var ns = master.x+"";
-  print("namespace: "+ns);
+// Need to use a commitQuorum of 2 rather than the default of 'votingMembers', which includes the
+// buildIndexes:false node. The index build will otherwise fail early.
+assert.commandWorked(primary.runCommand({
+    createIndexes: 'x',
+    indexes: [{key: {y: 1}, name: 'y_1'}],
+    commitQuorum: 2,
+}));
 
-  // can't query system.indexes from slave, so we'll look at coll.stats()
-  printjson(slave[0].adminCommand({replSetGetStatus:1}));
-  printjson(slave[0].getSisterDB("local").system.replset.findOne());
-  printjson(master.stats());
-  printjson(slave[0].stats());
-  printjson(slave[1].stats());
-  printjson(master.x.stats());
-  printjson(slave[0].x.stats());
-  printjson(slave[1].x.stats());
-  print("sleeping");  
-  sleep(20000);
-  var indexes = slave[0].stats().indexes;
-  assert.eq(indexes, 2, 'number of indexes');
-
-  indexes = slave[1].stats().indexes;
-  assert.eq(indexes, 1);
-
-  
-  indexes = slave[0].x.stats().indexSizes;
-  printjson(indexes);
-  
-  var count = 0;
-  for (var i in indexes) {
-    count++;
-    if (i == "_id_") {
-      continue;
-    }
-    print(i);
-    print(i.match(/y_/));
-    assert(i.match(/y_/));
-  }
-
-  assert.eq(count, 2);
-  
-  indexes = slave[1].x.stats().indexSizes;
-  printjson(indexes);
-
-  count = 0;
-  for (var i in indexes) {
-    count++;
-  }  
-
-  assert.eq(count, 1);
-
-  replTest.stopSet(15);
+for (i = 0; i < 100; i++) {
+    primary.x.insert({x: 1, y: "abc", c: 1});
 }
 
-doTest(15);
+replTest.awaitReplication();
+
+assert.commandWorked(secondaries[0].runCommand({count: "x"}));
+
+var indexes = secondaries[0].stats().indexes;
+assert.eq(indexes, 2, 'number of indexes');
+
+indexes = secondaries[1].stats().indexes;
+assert.eq(indexes, 1);
+
+indexes = secondaries[0].x.stats().indexSizes;
+
+var count = 0;
+for (i in indexes) {
+    count++;
+    if (i == "_id_") {
+        continue;
+    }
+    assert(i.match(/y_/));
+}
+
+assert.eq(count, 2);
+
+indexes = secondaries[1].x.stats().indexSizes;
+
+count = 0;
+for (i in indexes) {
+    count++;
+}
+
+assert.eq(count, 1);
+
+replTest.stopSet();

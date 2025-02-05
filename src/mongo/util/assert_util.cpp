@@ -1,238 +1,398 @@
-// assert_util.cpp
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
-
-#include "mongo/pch.h"
 
 #include "mongo/util/assert_util.h"
 
-using namespace std;
+#include <boost/exception/diagnostic_information.hpp>
+#include <boost/exception/exception.hpp>
+#include <exception>
+#include <ostream>
 
-#ifndef _WIN32
-#include <cxxabi.h>
-#include <sys/file.h>
-#endif
-
-#include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/lasterror.h"
+#include "mongo/config.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/debugger.h"
+#include "mongo/util/exit_code.h"
+#include "mongo/util/quick_exit.h"
+#include "mongo/util/signal_handlers_synchronous.h"
 #include "mongo/util/stacktrace.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAssert
+
+
+#define TRIPWIRE_ASSERTION_ID 4457000
+#define XSTR_INNER_(x) #x
+#define XSTR(x) XSTR_INNER_(x)
 
 namespace mongo {
-
-    AssertionCount assertionCount;
-
-    AssertionCount::AssertionCount()
-        : regular(0),warning(0),msg(0),user(0),rollovers(0) {
-    }
-
-    void AssertionCount::rollover() {
-        rollovers++;
-        regular = 0;
-        warning = 0;
-        msg = 0;
-        user = 0;
-    }
-
-    void AssertionCount::condrollover( int newvalue ) {
-        static const int rolloverPoint = ( 1 << 30 );
-        if ( newvalue >= rolloverPoint )
-            rollover();
-    }
-
-    bool DBException::traceExceptions = false;
-
-    string DBException::toString() const {
-        stringstream ss;
-        ss << getCode() << " " << what();
-        return ss.str();
-    }
-
-    void DBException::traceIfNeeded( const DBException& e ) {
-        if( traceExceptions && ! inShutdown() ){
-            warning() << "DBException thrown" << causedBy( e ) << endl;
-            printStackTrace();
-        }
-    }
-
-    ErrorCodes::Error DBException::convertExceptionCode(int exCode) {
-        if (exCode == 0) return ErrorCodes::UnknownError;
-        return static_cast<ErrorCodes::Error>(exCode);
-    }
-
-    void ExceptionInfo::append( BSONObjBuilder& b , const char * m , const char * c ) const {
-        if ( msg.empty() )
-            b.append( m , "unknown assertion" );
-        else
-            b.append( m , msg );
-
-        if ( code )
-            b.append( c , code );
-    }
-
-    /* "warning" assert -- safe to continue, so we don't throw exception. */
-    NOINLINE_DECL void wasserted(const char *msg, const char *file, unsigned line) {
-        static bool rateLimited;
-        static time_t lastWhen;
-        static unsigned lastLine;
-        if( lastLine == line && time(0)-lastWhen < 5 ) { 
-            if( !rateLimited ) { 
-                rateLimited = true;
-                log() << "rate limiting wassert" << endl;
-            }
-            return;
-        }
-        lastWhen = time(0);
-        lastLine = line;
-
-        problem() << "warning assertion failure " << msg << ' ' << file << ' ' << dec << line << endl;
-        logContext();
-        setLastError(0,msg && *msg ? msg : "wassertion failure");
-        assertionCount.condrollover( ++assertionCount.warning );
-#if defined(_DEBUG) || defined(_DURABLEDEFAULTON) || defined(_DURABLEDEFAULTOFF)
-        // this is so we notice in buildbot
-        log() << "\n\n***aborting after wassert() failure in a debug/test build\n\n" << endl;
-        abort();
-#endif
-    }
-
-    NOINLINE_DECL void verifyFailed(const char *msg, const char *file, unsigned line) {
-        assertionCount.condrollover( ++assertionCount.regular );
-        problem() << "Assertion failure " << msg << ' ' << file << ' ' << dec << line << endl;
-        logContext();
-        setLastError(0,msg && *msg ? msg : "assertion failure");
-        stringstream temp;
-        temp << "assertion " << file << ":" << line;
-        AssertionException e(temp.str(),0);
-        breakpoint();
-#if defined(_DEBUG) || defined(_DURABLEDEFAULTON) || defined(_DURABLEDEFAULTOFF)
-        // this is so we notice in buildbot
-        log() << "\n\n***aborting after verify() failure as this is a debug/test build\n\n" << endl;
-        abort();
-#endif
-        throw e;
-    }
-
-    NOINLINE_DECL void fassertFailed( int msgid ) {
-        problem() << "Fatal Assertion " << msgid << endl;
-        logContext();
-        breakpoint();
-        log() << "\n\n***aborting after fassert() failure\n\n" << endl;
-        abort();
-    }
-
-    NOINLINE_DECL void fassertFailedNoTrace( int msgid ) {
-        problem() << "Fatal Assertion " << msgid << endl;
-        breakpoint();
-        log() << "\n\n***aborting after fassert() failure\n\n" << endl;
-        ::_exit(EXIT_ABRUPT); // bypass our handler for SIGABRT, which prints a stack trace.
-    }
-
-    MONGO_COMPILER_NORETURN void fassertFailedWithStatus(int msgid, const Status& status) {
-        problem() << "Fatal assertion " <<  msgid << " " << status;
-        logContext();
-        breakpoint();
-        log() << "\n\n***aborting after fassert() failure\n\n" << endl;
-        abort();
-    }
-
-    void uasserted(int msgid , const string &msg) {
-        uasserted(msgid, msg.c_str());
-    }
-
-    void UserException::appendPrefix( stringstream& ss ) const { ss << "userassert:"; }
-    void MsgAssertionException::appendPrefix( stringstream& ss ) const { ss << "massert:"; }
-
-    NOINLINE_DECL void uasserted(int msgid, const char *msg) {
-        assertionCount.condrollover( ++assertionCount.user );
-        LOG(1) << "User Assertion: " << msgid << ":" << msg << endl;
-        setLastError(msgid,msg);
-        throw UserException(msgid, msg);
-    }
-
-    void msgasserted(int msgid, const string &msg) {
-        msgasserted(msgid, msg.c_str());
-    }
-
-    NOINLINE_DECL void msgasserted(int msgid, const char *msg) {
-        assertionCount.condrollover( ++assertionCount.warning );
-        log() << "Assertion: " << msgid << ":" << msg << endl;
-        setLastError(msgid,msg && *msg ? msg : "massert failure");
-        //breakpoint();
-        logContext();
-        throw MsgAssertionException(msgid, msg);
-    }
-
-    NOINLINE_DECL void msgassertedNoTrace(int msgid, const char *msg) {
-        assertionCount.condrollover( ++assertionCount.warning );
-        log() << "Assertion: " << msgid << ":" << msg << endl;
-        setLastError(msgid,msg && *msg ? msg : "massert failure");
-        throw MsgAssertionException(msgid, msg);
-    }
-
-    NOINLINE_DECL void streamNotGood( int code , const std::string& msg , std::ios& myios ) {
-        stringstream ss;
-        // errno might not work on all systems for streams
-        // if it doesn't for a system should deal with here
-        ss << msg << " stream invalid: " << errnoWithDescription();
-        throw UserException( code , ss.str() );
-    }
-
-    string errnoWithPrefix( const char * prefix ) {
-        stringstream ss;
-        if ( prefix )
-            ss << prefix << ": ";
-        ss << errnoWithDescription();
-        return ss.str();
-    }
-
-    string demangleName( const type_info& typeinfo ) {
-#ifdef _WIN32
-        return typeinfo.name();
-#else
-        int status;
-
-        char * niceName = abi::__cxa_demangle(typeinfo.name(), 0, 0, &status);
-        if ( ! niceName )
-            return typeinfo.name();
-
-        string s = niceName;
-        free(niceName);
-        return s;
-#endif
-    }
-
-    string ExceptionInfo::toString() const {
-        stringstream ss; ss << "exception: " << code << " " << msg; return ss.str(); 
-    }
-
-    NOINLINE_DECL ErrorMsg::ErrorMsg(const char *msg, char ch) {
-        int l = strlen(msg);
-        verify( l < 128);
-        memcpy(buf, msg, l);
-        char *p = buf + l;
-        p[0] = ch;
-        p[1] = 0;
-    }
-
-    NOINLINE_DECL ErrorMsg::ErrorMsg(const char *msg, unsigned val) {
-        int l = strlen(msg);
-        verify( l < 128);
-        memcpy(buf, msg, l);
-        char *p = buf + l;
-        sprintf(p, "%u", val);
-    }
-
+namespace {
+void logScopedDebugInfo() {
+    auto diagStack = scopedDebugInfoStack().getAll();
+    if (diagStack.empty())
+        return;
+    LOGV2_FATAL_OPTIONS(
+        4106400,
+        logv2::LogOptions(logv2::FatalMode::kContinue, logv2::LogTruncation::Disabled),
+        "ScopedDebugInfo",
+        "scopedDebugInfo"_attr = diagStack);
 }
+
+void logErrorBlock() {
+    // Logging in this order ensures that the stack trace is printed even if something goes wrong
+    // while printing ScopedDebugInfo.
+    printStackTrace();
+    logScopedDebugInfo();
+}
+
+/**
+ * Rather than call std::abort directly, assertion and invariant failures that wish to abort the
+ * process should call this function, which ensures that std::abort is invoked at most once per
+ * process even if multiple threads attempt to abort the process concurrently.
+ */
+MONGO_COMPILER_NORETURN void callAbort() {
+    thread_local int reentry = 0;
+    if (reentry++)
+        endProcessWithSignal(SIGABRT);
+
+    [[maybe_unused]] static auto initOnce = (std::abort(), 0);
+    MONGO_COMPILER_UNREACHABLE;
+}
+}  // namespace
+
+AssertionCount assertionCount;
+
+AssertionCount::AssertionCount() : regular(0), warning(0), msg(0), user(0), rollovers(0) {}
+
+void AssertionCount::rollover() {
+    rollovers.fetchAndAdd(1);
+    regular.store(0);
+    warning.store(0);
+    msg.store(0);
+    user.store(0);
+}
+
+void AssertionCount::condrollover(int newvalue) {
+    static const int rolloverPoint = (1 << 30);
+    if (newvalue >= rolloverPoint)
+        rollover();
+}
+
+void DBException::traceIfNeeded(const DBException& e) {
+    const bool traceNeeded = traceExceptions.load() ||
+        (e.code() == ErrorCodes::WriteConflict && traceWriteConflictExceptions.load());
+    if (traceNeeded) {
+        LOGV2_WARNING(23075, "DBException thrown", "error"_attr = e);
+        logErrorBlock();
+    }
+}
+
+MONGO_COMPILER_NOINLINE void verifyFailed(const char* expr, const char* file, unsigned line) {
+    assertionCount.condrollover(assertionCount.regular.addAndFetch(1));
+    LOGV2_ERROR(
+        23076, "Assertion failure", "expr"_attr = expr, "file"_attr = file, "line"_attr = line);
+    logErrorBlock();
+    std::stringstream temp;
+    temp << "assertion " << file << ":" << line;
+
+    breakpoint();
+#if defined(MONGO_CONFIG_DEBUG_BUILD)
+    // this is so we notice in buildbot
+    LOGV2_FATAL_CONTINUE(
+        23078, "\n\n***aborting after verify() failure as this is a debug/test build\n\n");
+    callAbort();
+#endif
+    error_details::throwExceptionForStatus(Status(ErrorCodes::UnknownError, temp.str()));
+}
+
+MONGO_COMPILER_NOINLINE void invariantFailed(const char* expr,
+                                             const char* file,
+                                             unsigned line) noexcept {
+    LOGV2_FATAL_CONTINUE(
+        23079, "Invariant failure", "expr"_attr = expr, "file"_attr = file, "line"_attr = line);
+    breakpoint();
+    LOGV2_FATAL_CONTINUE(23080, "\n\n***aborting after invariant() failure\n\n");
+    callAbort();
+}
+
+MONGO_COMPILER_NOINLINE void invariantFailedWithMsg(const char* expr,
+                                                    const std::string& msg,
+                                                    const char* file,
+                                                    unsigned line) noexcept {
+    LOGV2_FATAL_CONTINUE(23081,
+                         "Invariant failure",
+                         "expr"_attr = expr,
+                         "msg"_attr = msg,
+                         "file"_attr = file,
+                         "line"_attr = line);
+    breakpoint();
+    LOGV2_FATAL_CONTINUE(23082, "\n\n***aborting after invariant() failure\n\n");
+    callAbort();
+}
+
+MONGO_COMPILER_NOINLINE void invariantOKFailed(const char* expr,
+                                               const Status& status,
+                                               const char* file,
+                                               unsigned line) noexcept {
+    LOGV2_FATAL_CONTINUE(23083,
+                         "Invariant failure",
+                         "expr"_attr = expr,
+                         "error"_attr = redact(status),
+                         "file"_attr = file,
+                         "line"_attr = line);
+    breakpoint();
+    LOGV2_FATAL_CONTINUE(23084, "\n\n***aborting after invariant() failure\n\n");
+    callAbort();
+}
+
+MONGO_COMPILER_NOINLINE void invariantOKFailedWithMsg(const char* expr,
+                                                      const Status& status,
+                                                      const std::string& msg,
+                                                      const char* file,
+                                                      unsigned line) noexcept {
+    LOGV2_FATAL_CONTINUE(23085,
+                         "Invariant failure",
+                         "expr"_attr = expr,
+                         "msg"_attr = msg,
+                         "error"_attr = redact(status),
+                         "file"_attr = file,
+                         "line"_attr = line);
+    breakpoint();
+    LOGV2_FATAL_CONTINUE(23086, "\n\n***aborting after invariant() failure\n\n");
+    callAbort();
+}
+
+MONGO_COMPILER_NOINLINE void invariantStatusOKFailed(const Status& status,
+                                                     const char* file,
+                                                     unsigned line) noexcept {
+    LOGV2_FATAL_CONTINUE(23087,
+                         "Invariant failure",
+                         "error"_attr = redact(status),
+                         "file"_attr = file,
+                         "line"_attr = line);
+    breakpoint();
+    LOGV2_FATAL_CONTINUE(23088, "\n\n***aborting after invariant() failure\n\n");
+    callAbort();
+}
+
+namespace fassert_detail {
+
+MONGO_COMPILER_NOINLINE void failed(SourceLocation loc, MsgId msgid) noexcept {
+    LOGV2_FATAL_CONTINUE(23089,
+                         "Fatal assertion",
+                         "msgid"_attr = msgid.id,
+                         "file"_attr = loc.file_name(),
+                         "line"_attr = loc.line());
+    breakpoint();
+    LOGV2_FATAL_CONTINUE(23090, "\n\n***aborting after fassert() failure\n\n");
+    callAbort();
+}
+
+MONGO_COMPILER_NORETURN void failed(SourceLocation loc,
+                                    MsgId msgid,
+                                    const Status& status) noexcept {
+    LOGV2_FATAL_CONTINUE(23093,
+                         "Fatal assertion",
+                         "msgid"_attr = msgid.id,
+                         "error"_attr = redact(status),
+                         "file"_attr = loc.file_name(),
+                         "line"_attr = loc.line());
+    breakpoint();
+    LOGV2_FATAL_CONTINUE(23094, "\n\n***aborting after fassert() failure\n\n");
+    callAbort();
+}
+
+MONGO_COMPILER_NOINLINE void failedNoTrace(SourceLocation loc, MsgId msgid) noexcept {
+    LOGV2_FATAL_CONTINUE(23091,
+                         "Fatal assertion",
+                         "msgid"_attr = msgid.id,
+                         "file"_attr = loc.file_name(),
+                         "line"_attr = loc.line());
+    breakpoint();
+    LOGV2_FATAL_CONTINUE(23092, "\n\n***aborting after fassert() failure\n\n");
+    quickExit(ExitCode::abrupt);
+}
+
+MONGO_COMPILER_NORETURN void failedNoTrace(SourceLocation loc,
+                                           MsgId msgid,
+                                           const Status& status) noexcept {
+    LOGV2_FATAL_CONTINUE(23095,
+                         "Fatal assertion",
+                         "msgid"_attr = msgid.id,
+                         "error"_attr = redact(status),
+                         "file"_attr = loc.file_name(),
+                         "line"_attr = loc.line());
+    breakpoint();
+    LOGV2_FATAL_CONTINUE(23096, "\n\n***aborting after fassert() failure\n\n");
+    quickExit(ExitCode::abrupt);
+}
+
+}  // namespace fassert_detail
+
+MONGO_COMPILER_NOINLINE void uassertedWithLocation(const Status& status,
+                                                   const char* file,
+                                                   unsigned line) {
+    assertionCount.condrollover(assertionCount.user.addAndFetch(1));
+    LOGV2_DEBUG(23074,
+                1,
+                "User assertion",
+                "error"_attr = redact(status),
+                "file"_attr = file,
+                "line"_attr = line);
+    error_details::throwExceptionForStatus(status);
+}
+
+MONGO_COMPILER_NOINLINE void msgassertedWithLocation(const Status& status,
+                                                     const char* file,
+                                                     unsigned line) {
+    assertionCount.condrollover(assertionCount.msg.addAndFetch(1));
+    LOGV2_ERROR(
+        23077, "Assertion", "error"_attr = redact(status), "file"_attr = file, "line"_attr = line);
+    error_details::throwExceptionForStatus(status);
+}
+
+void iassertFailed(const Status& status, SourceLocation loc) {
+    LOGV2_DEBUG(4892201,
+                3,
+                "Internal assertion",
+                "error"_attr = status,
+                "location"_attr = SourceLocationHolder(std::move(loc)));
+    error_details::throwExceptionForStatus(status);
+}
+
+void tassertFailed(const Status& status, SourceLocation loc) {
+    assertionCount.condrollover(assertionCount.tripwire.addAndFetch(1));
+    LOGV2_ERROR(TRIPWIRE_ASSERTION_ID,
+                "Tripwire assertion",
+                "error"_attr = status,
+                "location"_attr = SourceLocationHolder(std::move(loc)));
+    logErrorBlock();
+    breakpoint();
+    error_details::throwExceptionForStatus(status);
+}
+
+bool haveTripwireAssertionsOccurred() {
+    return assertionCount.tripwire.load() != 0;
+}
+
+void warnIfTripwireAssertionsOccurred() {
+    if (haveTripwireAssertionsOccurred()) {
+        LOGV2(4457002,
+              "Detected prior failed tripwire assertions, "
+              "please check your logs for \"Tripwire assertion\" entries with log "
+              "id " XSTR(TRIPWIRE_ASSERTION_ID) ".",
+              "occurrences"_attr = assertionCount.tripwire.load());
+    }
+}
+
+std::string causedBy(StringData e) {
+    static constexpr auto prefix = " :: caused by :: "_sd;
+    std::string out;
+    out.reserve(prefix.size() + e.size());
+    out.append(std::string_view{prefix});  // NOLINT
+    out.append(std::string_view{e});       // NOLINT
+    return out;
+}
+
+std::string demangleName(const std::type_info& typeinfo) {
+#ifdef _WIN32
+    return typeinfo.name();
+#else
+    int status;
+
+    char* niceName = abi::__cxa_demangle(typeinfo.name(), nullptr, nullptr, &status);
+    if (!niceName)
+        return typeinfo.name();
+
+    std::string s = niceName;
+    free(niceName);
+    return s;
+#endif
+}
+
+Status exceptionToStatus() {
+    try {
+        throw;
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    } catch (const std::exception& ex) {
+        return Status(ErrorCodes::UnknownError,
+                      str::stream() << "Caught std::exception of type " << demangleName(typeid(ex))
+                                    << ": " << ex.what());
+    } catch (const boost::exception& ex) {
+        return Status(ErrorCodes::UnknownError,
+                      str::stream()
+                          << "Caught boost::exception of type " << demangleName(typeid(ex)) << ": "
+                          << boost::diagnostic_information(ex));
+
+    } catch (...) {
+        return Status(ErrorCodes::UnknownError, "Caught exception of unknown type");
+    }
+}
+
+std::vector<std::string> ScopedDebugInfoStack::getAll() {
+    if (_loggingDepth > 0) {
+        return {};  // Re-entry detected.
+    }
+
+    _loggingDepth++;
+    ScopeGuard updateDepth = [&] {
+        _loggingDepth--;
+    };
+
+    std::vector<std::string> r;
+    r.reserve(_stack.size());
+    for (const auto& e : _stack) {
+        try {
+            r.push_back(e->toString());
+        } catch (...) {
+            LOGV2(9513400,
+                  "ScopedDebugInfo failed",
+                  "label"_attr = e->label(),
+                  "error"_attr = describeActiveException());
+        }
+    }
+
+    return r;
+}
+
+void reportFailedDestructor(SourceLocation loc) {
+    try {
+        throw;
+    } catch (...) {
+        std::ostringstream oss;
+        globalActiveExceptionWitness().describe(oss);
+        LOGV2_IMPL(4615600,
+                   logv2::LogSeverity::Log(),
+                   {logv2::LogComponent::kDefault},
+                   "Caught exception in destructor",
+                   "exception"_attr = oss.str(),
+                   "function"_attr = loc.function_name());
+    }
+}
+}  // namespace mongo

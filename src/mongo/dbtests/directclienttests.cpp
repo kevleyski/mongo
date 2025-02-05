@@ -1,163 +1,196 @@
-/** @file directclienttests.cpp
-*/
-
 /**
- *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#include "mongo/pch.h"
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/db.h"
-#include "mongo/db/instance.h"
-#include "mongo/db/json.h"
-#include "mongo/db/lasterror.h"
-#include "mongo/dbtests/dbtests.h"
-#include "mongo/util/timer.h"
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/dbclient_cursor.h"
+#include "mongo/db/client.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+
+namespace mongo {
 namespace DirectClientTests {
 
-    class ClientBase {
-    public:
-        // NOTE: Not bothering to backup the old error record.
-        ClientBase() {  mongo::lastError.reset( new LastError() );  }
-        virtual ~ClientBase() { }
-    protected:
-        static bool error() {
-            return !_client.getPrevError().getField( "err" ).isNull();
-        }
-        DBDirectClient &client() const { return _client; }
-    private:
-        static DBDirectClient _client;
-    };
-    DBDirectClient ClientBase::_client;
+const NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.b");
 
-    const char *ns = "a.b";
+class InsertMany {
+public:
+    virtual void run() {
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
 
-    class Capped : public ClientBase {
-    public:
-        virtual void run() {
-            for( int pass=0; pass < 3; pass++ ) {
-                client().createCollection(ns, 1024 * 1024, true, 999);
-                for( int j =0; j < pass*3; j++ )
-                    client().insert(ns, BSON("x" << j));
+        std::vector<BSONObj> objs;
+        objs.push_back(BSON("_id" << 1));
+        objs.push_back(BSON("_id" << 1));
+        objs.push_back(BSON("_id" << 2));
 
-                // test truncation of a capped collection
-                if( pass ) {
-                    BSONObj info;
-                    BSONObj cmd = BSON( "captrunc" << "b" << "n" << 1 << "inc" << true );
-                    //cout << cmd.toString() << endl;
-                    bool ok = client().runCommand("a", cmd, info);
-                    //cout << info.toString() << endl;
-                    verify(ok);
-                }
+        client.dropCollection(nss);
 
-                verify( client().dropCollection(ns) );
-            }
-        }
-    };
+        auto response = client.insertAcknowledged(nss, objs);
+        ASSERT_EQUALS(ErrorCodes::DuplicateKey, getStatusFromWriteCommandReply(response));
+        ASSERT_EQUALS((int)client.count(nss), 1);
 
-    class InsertMany : ClientBase {
-    public:
-        virtual void run(){
-            vector<BSONObj> objs;
-            objs.push_back(BSON("_id" << 1));
-            objs.push_back(BSON("_id" << 1));
-            objs.push_back(BSON("_id" << 2));
+        client.dropCollection(nss);
 
+        response = client.insertAcknowledged(nss, objs, false /*ordered*/);
+        ASSERT_EQUALS(ErrorCodes::DuplicateKey, getStatusFromWriteCommandReply(response));
+        ASSERT_EQUALS((int)client.count(nss), 2);
+    }
+};
 
-            client().dropCollection(ns);
-            client().insert(ns, objs);
-            ASSERT_EQUALS(client().getLastErrorDetailed()["code"].numberInt(), 11000);
-            ASSERT_EQUALS((int)client().count(ns), 1);
+class BadNSCmd {
+public:
+    virtual void run() {
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
 
-            client().dropCollection(ns);
-            client().insert(ns, objs, InsertOption_ContinueOnError);
-            ASSERT_EQUALS(client().getLastErrorDetailed()["code"].numberInt(), 11000);
-            ASSERT_EQUALS((int)client().count(ns), 2);
-        }
+        BSONObj result;
+        BSONObj cmdObj = BSON("count"
+                              << "");
+        ASSERT(!client.runCommand(
+            DatabaseName::createDatabaseName_forTest(boost::none, ""), cmdObj, result))
+            << result;
+        ASSERT_EQ(getStatusFromCommandResult(result), ErrorCodes::InvalidNamespace);
+    }
+};
 
-    };
+class BadNSQuery {
+public:
+    virtual void run() {
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
 
-    class BadNSCmd : ClientBase {
-    public:
-        virtual void run(){
-            BSONObj result;
-            BSONObj cmdObj = BSON( "count" << "" );
-            ASSERT_THROWS( client().runCommand( "", cmdObj, result ), UserException );
-        }
-    };
+        FindCommandRequest findRequest{NamespaceString{}};
+        findRequest.setLimit(1);
+        ASSERT_THROWS_CODE(client.find(std::move(findRequest))->nextSafe(),
+                           AssertionException,
+                           ErrorCodes::InvalidNamespace);
+    }
+};
 
-    class BadNSQuery : ClientBase {
-    public:
-        virtual void run(){
-            auto_ptr<DBClientCursor> cursor = client().query( "", Query(), 1 );
-            ASSERT(cursor->more());
-            BSONObj result = cursor->next().getOwned();
-            ASSERT( result.hasField( "$err" ));
-            ASSERT_EQUALS(result["code"].Int(), 16332);
-        }
-    };
+class BadNSGetMore {
+public:
+    virtual void run() {
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
 
-    class BadNSGetMore : ClientBase {
-    public:
-        virtual void run(){
-            auto_ptr<DBClientCursor> cursor = client().getMore("", 1, 1);
-            ASSERT(cursor->more());
-            BSONObj result = cursor->next().getOwned();
-            ASSERT(result.hasField("$err"));
-            ASSERT_EQUALS(result["code"].Int(), 16258);
-        }
-    };
+        ASSERT_THROWS_CODE(
+            client.getMore(NamespaceString::createNamespaceString_forTest(""), 1)->nextSafe(),
+            AssertionException,
+            ErrorCodes::InvalidNamespace);
+    }
+};
 
-    class BadNSInsert : ClientBase {
-    public:
-        virtual void run(){
-            client().insert( "", BSONObj(), 0 );
-            ASSERT( !client().getLastError().empty() );
-        }
-    };
+class BadNSInsert {
+public:
+    virtual void run() {
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
 
-    class BadNSUpdate : ClientBase {
-    public:
-        virtual void run(){
-            client().update( "", Query(), BSON( "$set" << BSON( "x" << 1 )) );
-            ASSERT( !client().getLastError().empty() );
-        }
-    };
-    
-    class BadNSRemove : ClientBase {
-    public:
-        virtual void run(){
-            client().remove( "", Query() );
-            ASSERT( !client().getLastError().empty() );
-        }
-    };
+        auto response = client.insertAcknowledged(
+            NamespaceString::createNamespaceString_forTest(""), {BSONObj()});
+        ASSERT_EQ(ErrorCodes::InvalidNamespace, getStatusFromCommandResult(response));
+    }
+};
 
-    class All : public Suite {
-    public:
-        All() : Suite( "directclient" ) {
-        }
-        void setupTests() {
-            add< Capped >();
-            add< InsertMany >();
-            add< BadNSCmd >();
-            add< BadNSQuery >();
-            add< BadNSGetMore >();
-            add< BadNSInsert >();
-            add< BadNSUpdate >();
-            add< BadNSRemove >();
-        }
-    } myall;
-}
+class BadNSUpdate {
+public:
+    virtual void run() {
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
+
+        auto response =
+            client.updateAcknowledged(NamespaceString::createNamespaceString_forTest(""),
+                                      BSONObj{} /*filter*/,
+                                      BSON("$set" << BSON("x" << 1)));
+        ASSERT_EQ(ErrorCodes::InvalidNamespace, getStatusFromCommandResult(response));
+    }
+};
+
+class BadNSRemove {
+public:
+    virtual void run() {
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
+
+        auto response = client.removeAcknowledged(
+            NamespaceString::createNamespaceString_forTest(""), BSONObj{} /*filter*/);
+        ASSERT_EQ(ErrorCodes::InvalidNamespace, getStatusFromCommandResult(response));
+    }
+};
+
+class All : public unittest::OldStyleSuiteSpecification {
+public:
+    All() : OldStyleSuiteSpecification("directclient") {}
+    void setupTests() override {
+        add<InsertMany>();
+        add<BadNSCmd>();
+        add<BadNSQuery>();
+        add<BadNSGetMore>();
+        add<BadNSInsert>();
+        add<BadNSUpdate>();
+        add<BadNSRemove>();
+    }
+};
+
+unittest::OldStyleSuiteInitializer<All> myall;
+
+}  // namespace DirectClientTests
+}  // namespace mongo

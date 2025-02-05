@@ -1,30 +1,30 @@
+// Utility functions for FTS tests
+//
+export function queryIDS(coll, search, filter, extra, limit) {
+    var query = {"$text": {"$search": search}};
+    if (extra)
+        query = {"$text": Object.extend({"$search": search}, extra)};
+    if (filter)
+        Object.extend(query, filter);
 
-// make sure we're enabled
-db.adminCommand( { setParameter : "*", textSearchEnabled : true } );
+    var result;
+    if (limit)
+        result = coll.find(query, {score: {"$meta": "textScore"}})
+                     .sort({score: {"$meta": "textScore"}})
+                     .limit(limit);
+    else
+        result =
+            coll.find(query, {score: {"$meta": "textScore"}}).sort({score: {"$meta": "textScore"}});
 
-if ( "isdbgrid" == db.runCommand( "ismaster" ).msg ) {
-    db.getSisterDB( "config" ).shards.find().forEach(
-        function(shard) {
-            var m = new Mongo( shard.host );
-            m.getDB( "admin" ).runCommand( { setParameter : "*", textSearchEnabled: true } );
-        }
-    );
+    return getIDS(result);
 }
 
-function queryIDS( coll, search, filter, extra ){
-    var cmd = { search : search }
-    if ( filter )
-        cmd.filter = filter;
-    if ( extra )
-        Object.extend( cmd, extra );
-    lastCommadResult = coll.runCommand( "text" , cmd);
+// Return an array of _ids from a cursor
+export function getIDS(cursor) {
+    if (!cursor)
+        return [];
 
-    return getIDS( lastCommadResult );
-}
-
-function getIDS( commandResult ){
-    if ( ! ( commandResult && commandResult.results ) )
-        return []
-
-    return commandResult.results.map( function(z){ return z.obj._id; } )
+    return cursor.map(function(z) {
+        return z._id;
+    });
 }

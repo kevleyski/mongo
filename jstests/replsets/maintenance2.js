@@ -1,63 +1,50 @@
-function shouldFail( f ) {
-    e = assert.throws( function() {
-                      f();
-                      if( db.getLastError() ) {
-                        throw db.getLastError();
-                      }
-                      } );
+// Test that certain operations fail in recovery mode.
+
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
+// Replica set testing API
+// Create a new replica set test. Specify set name and the number of nodes you want.
+var replTest = new ReplSetTest({name: 'testSet', nodes: 3});
+
+// call startSet() to start each mongod in the replica set
+// this returns a list of nodes
+var nodes = replTest.startSet();
+
+// Call initiate() to send the replSetInitiate command
+// This will wait for initiation
+replTest.initiate();
+
+// Call getPrimary to return a reference to the node that's been
+// elected primary.
+var primary = replTest.getPrimary();
+
+// save some records
+var len = 100;
+for (var i = 0; i < len; ++i) {
+    primary.getDB("foo").foo.save({a: i});
 }
 
-doTest = function( signal ) {
-    // Test that certain operations fail in recovery mode
+// This method will check the oplogs of the primary
+// and secondaries in the set and wait until the change has replicated.
+// replTest.awaitReplication();
 
-    // Replica set testing API
-    // Create a new replica set test. Specify set name and the number of nodes you want.
-    var replTest = new ReplSetTest( {name: 'testSet', nodes: 3} );
+var secondaries = replTest.getSecondaries();
+assert.eq(2, secondaries.length, "Expected 2 secondaries but length was " + secondaries.length);
 
-    // call startSet() to start each mongod in the replica set
-    // this returns a list of nodes
-    var nodes = replTest.startSet();
+secondaries.forEach(function(secondary) {
+    // put secondary into maintenance (recovery) mode
+    assert.commandWorked(secondary.getDB("foo").adminCommand({replSetMaintenance: 1}));
 
-    // Call initiate() to send the replSetInitiate command
-    // This will wait for initiation
-    replTest.initiate();
+    var stats = secondary.getDB("foo").adminCommand({replSetGetStatus: 1});
+    assert.eq(stats.myState, 3, "Secondary should be in recovering state.");
 
-    // Call getMaster to return a reference to the node that's been
-    // elected master.
-    var master = replTest.getMaster();
+    print("count should fail in recovering state...");
+    secondary.setSecondaryOk();
+    assert.commandFailed(secondary.getDB("foo").runCommand({count: "foo"}));
 
-    // save some records
-    var len = 100
-    for (var i = 0; i < len; ++i) {
-        master.getDB("foo").foo.save({a: i});
-    }
+    // unset maintenance mode when done
+    assert.commandWorked(secondary.getDB("foo").adminCommand({replSetMaintenance: 0}));
+});
 
-    // This method will check the oplogs of the master
-    // and slaves in the set and wait until the change has replicated.
-    // replTest.awaitReplication();
-
-    slaves = replTest.liveNodes.slaves;
-    assert( slaves.length == 2, "Expected 2 slaves but length was " + slaves.length );
-
-    slaves.forEach(function(slave) {
-        // put slave into maintenance (recovery) mode
-        slave.getDB("foo").adminCommand({replSetMaintenance:1});
-
-        stats = slave.getDB("foo").adminCommand({replSetGetStatus:1});
-        assert.eq(stats.myState, 3, "Slave should be in recovering state.");
-
-        print("group should fail in recovering state...");
-        slave.slaveOk = true;
-        shouldFail( function() { slave.getDB("foo").foo.group({initial: {n:0}, reduce: function(obj,out){out.n++;}}); } );
-
-        print("count should fail in recovering state...");
-        slave.slaveOk = true;
-        shouldFail( function() { slave.getDB("foo").foo.count(); } );
-    });
-
-    // Shut down the set and finish the test.
-    replTest.stopSet( signal );
-}
-
-doTest( 15 );
-print("SUCCESS");
+// Shut down the set and finish the test.
+replTest.stopSet();

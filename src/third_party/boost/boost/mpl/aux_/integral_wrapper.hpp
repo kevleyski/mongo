@@ -7,9 +7,9 @@
 //
 // See http://www.boost.org/libs/mpl for documentation.
 
-// $Id: integral_wrapper.hpp 49267 2008-10-11 06:19:02Z agurtovoy $
-// $Date: 2008-10-11 02:19:02 -0400 (Sat, 11 Oct 2008) $
-// $Revision: 49267 $
+// $Id$
+// $Date$
+// $Revision$
 
 // NO INCLUDE GUARDS, THE HEADER IS INTENDED FOR MULTIPLE INCLUSION!
 
@@ -53,6 +53,15 @@ struct AUX_WRAPPER_NAME
     typedef AUX_WRAPPER_VALUE_TYPE value_type;
     typedef integral_c_tag tag;
 
+// MongoDB modification. This struct is used to wrap integral types and extend them to support
+// retrieval of predecessor and successor values using the <next> and <prior> typedefs. When it is
+// used to wrap enum types, a predecessor typedef is generated for the first enumerated value and a
+// successor typedef is generated for the last enumerated value. These generated values are
+// undefined for the enum, which means that the program is ill-formed. Clang 19 correctly diagnoses
+// this issue with -Wenum-constexpr-conversion.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wenum-constexpr-conversion"
+
 // have to #ifdef here: some compilers don't like the 'N + 1' form (MSVC),
 // while some other don't like 'value + 1' (Borland), and some don't like
 // either
@@ -63,7 +72,7 @@ struct AUX_WRAPPER_NAME
  public:
     typedef AUX_WRAPPER_INST(next_value) next;
     typedef AUX_WRAPPER_INST(prior_value) prior;
-#elif BOOST_WORKAROUND(__BORLANDC__, BOOST_TESTED_AT(0x561)) \
+#elif BOOST_WORKAROUND(BOOST_BORLANDC, BOOST_TESTED_AT(0x561)) \
     || BOOST_WORKAROUND(__IBMCPP__, BOOST_TESTED_AT(502)) \
     || (BOOST_WORKAROUND(__HP_aCC, <= 53800) && (BOOST_WORKAROUND(__hpxstd98, != 1)))
     typedef AUX_WRAPPER_INST( BOOST_MPL_AUX_STATIC_CAST(AUX_WRAPPER_VALUE_TYPE, (N + 1)) ) next;
@@ -73,11 +82,13 @@ struct AUX_WRAPPER_NAME
     typedef AUX_WRAPPER_INST( BOOST_MPL_AUX_STATIC_CAST(AUX_WRAPPER_VALUE_TYPE, (value - 1)) ) prior;
 #endif
 
+#pragma clang diagnostic pop
+
     // enables uniform function call syntax for families of overloaded 
     // functions that return objects of both arithmetic ('int', 'long',
     // 'double', etc.) and wrapped integral types (for an example, see 
     // "mpl/example/power.cpp")
-    operator AUX_WRAPPER_VALUE_TYPE() const { return static_cast<AUX_WRAPPER_VALUE_TYPE>(this->value); } 
+    BOOST_CONSTEXPR operator AUX_WRAPPER_VALUE_TYPE() const { return static_cast<AUX_WRAPPER_VALUE_TYPE>(this->value); } 
 };
 
 #if !defined(BOOST_NO_INCLASS_MEMBER_INITIALIZATION)

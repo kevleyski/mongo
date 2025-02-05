@@ -1,186 +1,181 @@
 /**
-*    Copyright (C) 2012 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects
-*    for all of the code used other than as permitted herein. If you modify
-*    file(s) with this exception, you may extend this exception to your
-*    version of the file(s), but you are not obligated to do so. If you do not
-*    wish to do so, delete this exception statement from your version. If you
-*    delete this exception statement from all source files in the program,
-*    then also delete it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
-#include "mongo/db/jsobj.h"
-#include "mongo/s/chunk_version.h"
-#include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <string>
+#include <utility>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/error_extra_info.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/s/database_version.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/util/concurrency/notification.h"
+#include "mongo/util/future.h"
 
 namespace mongo {
 
-    using mongoutils::str::stream;
+class StaleConfigInfo final : public ErrorExtraInfo {
+public:
+    static constexpr auto code = ErrorCodes::StaleConfig;
+    enum class OperationType { kRead, kWrite };
 
-    /**
-     * Thrown whenever your config info for a given shard/chunk is out of date.
-     */
-    class StaleConfigException : public AssertionException {
-    public:
-        StaleConfigException( const string& ns,
-                              const string& raw,
-                              int code,
-                              ChunkVersion received,
-                              ChunkVersion wanted,
-                              bool justConnection = false )
-            : AssertionException(stream() << raw << " ( ns : " << ns
-                                          << ", received : " << received.toString()
-                                          << ", wanted : " << wanted.toString()
-                                          << ", " << ( code == SendStaleConfigCode ?
-                                                       "send" : "recv" ) << " )",
-                                 code ),
-              _justConnection(justConnection),
-              _ns(ns),
-              _received( received ),
-              _wanted( wanted ) {
-        }
+    StaleConfigInfo(NamespaceString nss,
+                    ShardVersion received,
+                    boost::optional<ShardVersion> wanted,
+                    ShardId shardId,
+                    boost::optional<SharedSemiFuture<void>> criticalSectionSignal = boost::none,
+                    boost::optional<OperationType> duringOperationType = boost::none)
+        : _nss(std::move(nss)),
+          _received(received),
+          _wanted(wanted),
+          _shardId(shardId),
+          _criticalSectionSignal(std::move(criticalSectionSignal)),
+          _duringOperationType{duringOperationType} {}
 
-        /** Preferred if we're rebuilding this from a thrown exception */
-        StaleConfigException( const string& raw,
-                              int code,
-                              const BSONObj& error,
-                              bool justConnection = false )
-            : AssertionException( stream() << raw << " ( ns : "
-                                           << ( error["ns"].type() == String ?
-                                                error["ns"].String() : string("<unknown>") )
-                                           << ", received : "
-                                           << ChunkVersion::fromBSON( error, "vReceived" ).toString()
-                                           << ", wanted : "
-                                           << ChunkVersion::fromBSON( error, "vWanted" ).toString()
-                                           << ", "
-                                           << ( code == SendStaleConfigCode ?
-                                                "send" : "recv" ) << " )",
-                                  code ),
-              _justConnection(justConnection) ,
-              // For legacy reasons, we may not always get a namespace here
-              _ns( error["ns"].type() == String ? error["ns"].String() : "" ),
-              _received( ChunkVersion::fromBSON( error, "vReceived" ) ),
-              _wanted( ChunkVersion::fromBSON( error, "vWanted" ) ) {
-        }
+    const auto& getNss() const {
+        return _nss;
+    }
 
-        /**
-         * Needs message so when we trace all exceptions on construction we get a useful
-         * message
-         */
-        StaleConfigException() :
-            AssertionException( "initializing empty stale config exception object", 0 ) {
-        }
+    const auto& getVersionReceived() const {
+        return _received;
+    }
 
-        virtual ~StaleConfigException() throw() {}
+    const auto& getVersionWanted() const {
+        return _wanted;
+    }
 
-        virtual void appendPrefix( stringstream& ss ) const {
-            ss << "stale sharding config exception: ";
-        }
+    const auto& getShardId() const {
+        return _shardId;
+    }
 
-        bool justConnection() const { return _justConnection; }
+    auto getCriticalSectionSignal() const {
+        return _criticalSectionSignal;
+    }
 
-        string getns() const { return _ns; }
+    const auto& getDuringOperationType() const {
+        return _duringOperationType;
+    }
 
-        /**
-         * true if this exception would require a full reload of config data to resolve
-         */
-        bool requiresFullReload() const {
-            return ! _received.hasCompatibleEpoch( _wanted ) ||
-                     _received.isSet() != _wanted.isSet();
-        }
+    void serialize(BSONObjBuilder* bob) const override;
+    static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj& obj);
 
-        static bool parse( const string& big , string& ns , string& raw ) {
-            string::size_type start = big.find( '[' );
-            if ( start == string::npos )
-                return false;
-            string::size_type end = big.find( ']' ,start );
-            if ( end == string::npos )
-                return false;
+private:
+    NamespaceString _nss;
+    ShardVersion _received;
+    boost::optional<ShardVersion> _wanted;
+    ShardId _shardId;
 
-            ns = big.substr( start + 1 , ( end - start ) - 1 );
-            raw = big.substr( end + 1 );
-            return true;
-        }
+    // The following fields are not serialized and therefore do not get propagated to the router.
+    boost::optional<SharedSemiFuture<void>> _criticalSectionSignal;
+    boost::optional<OperationType> _duringOperationType;
+};
 
-        ChunkVersion getVersionReceived() const {
-            return _received;
-        }
+// TODO (SERVER-75888): Rename the StaleEpoch code to StaleUpstreamRouter and the info to
+// StaleUpstreamRouterInfo
+class StaleEpochInfo final : public ErrorExtraInfo {
+public:
+    static constexpr auto code = ErrorCodes::StaleEpoch;
 
-        ChunkVersion getVersionWanted() const {
-            return _wanted;
-        }
+    StaleEpochInfo(NamespaceString nss, ShardVersion received, ShardVersion wanted)
+        : _nss(std::move(nss)), _received(received), _wanted(wanted) {}
 
-        StaleConfigException& operator=( const StaleConfigException& elem ) {
+    const auto& getNss() const {
+        return _nss;
+    }
 
-            this->_ei.msg = elem._ei.msg;
-            this->_ei.code = elem._ei.code;
-            this->_justConnection = elem._justConnection;
-            this->_ns = elem._ns;
-            this->_received = elem._received;
-            this->_wanted = elem._wanted;
+    const auto& getVersionReceived() const {
+        return _received;
+    }
 
-            return *this;
-        }
+    const auto& getVersionWanted() const {
+        return _wanted;
+    }
 
-    private:
-        bool _justConnection;
-        string _ns;
-        ChunkVersion _received;
-        ChunkVersion _wanted;
-    };
+    void serialize(BSONObjBuilder* bob) const override;
+    static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj& obj);
 
-    class SendStaleConfigException : public StaleConfigException {
-    public:
-        SendStaleConfigException( const string& ns,
-                                  const string& raw,
-                                  ChunkVersion received,
-                                  ChunkVersion wanted,
-                                  bool justConnection = false )
-            : StaleConfigException( ns, raw, SendStaleConfigCode, received, wanted, justConnection ){
-        }
+private:
+    NamespaceString _nss;
 
-        SendStaleConfigException( const string& raw,
-                                  const BSONObj& error,
-                                  bool justConnection = false )
-            : StaleConfigException( raw, SendStaleConfigCode, error, justConnection ) {
-        }
-    };
+    ShardVersion _received;
+    ShardVersion _wanted;
+};
 
-    class RecvStaleConfigException : public StaleConfigException {
-    public:
-        RecvStaleConfigException( const string& ns,
-                                  const string& raw,
-                                  ChunkVersion received,
-                                  ChunkVersion wanted,
-                                  bool justConnection = false )
-            : StaleConfigException( ns, raw, RecvStaleConfigCode, received, wanted, justConnection ){
-        }
+class StaleDbRoutingVersion final : public ErrorExtraInfo {
+public:
+    static constexpr auto code = ErrorCodes::StaleDbVersion;
 
-        RecvStaleConfigException( const string& raw,
-                                  const BSONObj& error,
-                                  bool justConnection = false )
-            : StaleConfigException( raw, RecvStaleConfigCode, error, justConnection ) {
-        }
-    };
+    StaleDbRoutingVersion(
+        const DatabaseName& db,
+        DatabaseVersion received,
+        boost::optional<DatabaseVersion> wanted,
+        boost::optional<SharedSemiFuture<void>> criticalSectionSignal = boost::none)
+        : _db(std::move(db)),
+          _received(received),
+          _wanted(wanted),
+          _criticalSectionSignal(std::move(criticalSectionSignal)) {}
 
-} // namespace mongo
+    const auto& getDb() const {
+        return _db;
+    }
+
+    const auto& getVersionReceived() const {
+        return _received;
+    }
+
+    const auto& getVersionWanted() const {
+        return _wanted;
+    }
+
+    auto getCriticalSectionSignal() const {
+        return _criticalSectionSignal;
+    }
+
+    void serialize(BSONObjBuilder* bob) const override;
+    static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj&);
+
+private:
+    DatabaseName _db;
+    DatabaseVersion _received;
+    boost::optional<DatabaseVersion> _wanted;
+
+    // This signal does not get serialized and therefore does not get propagated to the router
+    boost::optional<SharedSemiFuture<void>> _criticalSectionSignal;
+};
+
+}  // namespace mongo

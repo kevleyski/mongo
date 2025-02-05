@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,124 +29,162 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstdint>
+#include <memory>
+#include <set>
 #include <vector>
 
-#include "mongo/db/diskloc.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/matcher.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sort_executor.h"
+#include "mongo/db/exec/sort_key_comparator.h"
+#include "mongo/db/exec/sort_key_generator.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/query/index_bounds.h"
-#include "mongo/platform/unordered_map.h"
+#include "mongo/db/index/sort_key_generator.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/sort_pattern.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/db/record_id.h"
 
 namespace mongo {
 
-    class BtreeKeyGenerator;
+/**
+ * Sorts the input received from the child according to the sort pattern provided. If
+ * 'addSortKeyMetadata' is true, then also attaches the sort key as metadata. This could be consumed
+ * downstream for a sort-merge on a merging node, or by a $meta:"sortKey" expression.
+ *
+ * Concrete implementations derive from this abstract base class by implementing methods for
+ * spooling and unspooling.
+ */
+class SortStage : public PlanStage {
+public:
+    static constexpr StringData kStageType = "SORT"_sd;
 
-    // External params for the sort stage.  Declared below.
-    class SortStageParams;
+    SortStage(boost::intrusive_ptr<ExpressionContext> expCtx,
+              WorkingSet* ws,
+              SortPattern sortPattern,
+              bool addSortKeyMetadata,
+              std::unique_ptr<PlanStage> child);
 
     /**
-     * Sorts the input received from the child according to the sort pattern provided.
-     *
-     * Preconditions: For each field in 'pattern', all inputs in the child must handle a
-     * getFieldDotted for that field.
+     * Loads the WorkingSetMember pointed to by 'wsid' into the set of objects being sorted. This
+     * should be called repeatedly until all documents are loaded, followed by a single call to
+     * 'loadingDone()'. Illegal to call after 'loadingDone()' has been called.
      */
-    class SortStage : public PlanStage {
-    public:
-        SortStage(const SortStageParams& params, WorkingSet* ws, PlanStage* child);
+    virtual void spool(WorkingSetID wsid) = 0;
 
-        virtual ~SortStage();
+    /**
+     * Indicates that all documents to be sorted have been loaded via 'spool()'. This method must
+     * not be called more than once.
+     */
+    virtual void loadingDone() = 0;
 
-        virtual bool isEOF();
-        virtual StageState work(WorkingSetID* out);
+    /**
+     * Returns an id referring to the next WorkingSetMember in the sorted stream of results.
+     *
+     * If there is another WSM, the id is returned via the out-parameter and the return value is
+     * PlanStage::ADVANCED. If there are no more documents remaining in the sorted stream, returns
+     * PlanStage::IS_EOF, and 'out' is left unmodified.
+     *
+     * Illegal to call before 'loadingDone()' has been called.
+     */
+    virtual StageState unspool(WorkingSetID* out) = 0;
 
-        virtual void prepareToYield();
-        virtual void recoverFromYield();
-        virtual void invalidate(const DiskLoc& dl);
+    StageState doWork(WorkingSetID* out) final;
 
-        PlanStageStats* getStats();
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-    private:
-        // Not owned by us.
-        WorkingSet* _ws;
+protected:
+    // Not owned by us.
+    WorkingSet* _ws;
 
-        // Where we're reading data to sort from.
-        scoped_ptr<PlanStage> _child;
+    const SortKeyGenerator _sortKeyGen;
 
-        // Our sort pattern.
-        BSONObj _pattern;
+    const bool _addSortKeyMetadata;
 
-        // Have we sorted our data? If so, we can access _resultIterator. If not,
-        // we're still populating _data.
-        bool _sorted;
+private:
+    // Whether or not we have finished loading data into '_sortExecutor'.
+    bool _populated = false;
+};
 
-        // Collection of working set members to sort with their respective sort key.
-        struct SortableDataItem {
-            WorkingSetID wsid;
-            BSONObj sortKey;
-            // Since we must replicate the behavior of a covered sort as much as possible we use the
-            // DiskLoc to break sortKey ties.
-            // See sorta.js.
-            DiskLoc loc;
-        };
-        vector<SortableDataItem> _data;
+/**
+ * Generic sorting implementation which can handle sorting any WorkingSetMember, including those
+ * that have RecordIds, metadata, or which represent index keys.
+ */
+class SortStageDefault final : public SortStage {
+public:
+    SortStageDefault(boost::intrusive_ptr<ExpressionContext> expCtx,
+                     WorkingSet* ws,
+                     SortPattern sortPattern,
+                     uint64_t limit,
+                     uint64_t maxMemoryUsageBytes,
+                     bool addSortKeyMetadata,
+                     std::unique_ptr<PlanStage> child);
 
-        // Iterates through _data post-sort returning it.
-        vector<SortableDataItem>::iterator _resultIterator;
+    void spool(WorkingSetID wsid) final;
 
-        // We buffer a lot of data and we want to look it up by DiskLoc quickly upon invalidation.
-        typedef unordered_map<DiskLoc, WorkingSetID, DiskLoc::Hasher> DataMap;
-        DataMap _wsidByDiskLoc;
+    void loadingDone() final;
 
-        //
-        // Sort Apparatus
-        //
+    StageState unspool(WorkingSetID* out) final;
 
-        // A comparator for SortableDataItems.
-        struct WorkingSetComparator;
-        boost::scoped_ptr<WorkingSetComparator> _cmp;
+    StageType stageType() const final {
+        return STAGE_SORT_DEFAULT;
+    }
 
-        // Bounds we should consider before sorting.
-        IndexBounds _bounds;
+    bool isEOF() const final {
+        return _sortExecutor.isEOF();
+    }
 
-        bool _hasBounds;
+    const SpecificStats* getSpecificStats() const final {
+        return &_sortExecutor.stats();
+    }
 
-        // Helper to extract sorting keys from documents containing dotted fields, arrays,
-        // or both.
-        boost::scoped_ptr<BtreeKeyGenerator> _keyGen;
+private:
+    SortExecutor<SortableWorkingSetMember> _sortExecutor;
+};
 
-        // Helper to filter keys, thus enforcing _bounds over whatever keys generated with
-        // _keyGen.
-        boost::scoped_ptr<IndexBoundsChecker> _boundsChecker;
+/**
+ * Optimized sorting implementation which can be used for WorkingSetMembers in a fetched state that
+ * have no metadata. This implementation is faster but less general than WorkingSetMemberSortStage.
+ *
+ * For performance, this implementation discards record ids and returns WorkingSetMembers in the
+ * OWNED_OBJ state. Therefore, this sort implementation cannot be used if the plan requires the
+ * record id to be preserved (e.g. for update or delete plans, where an ancestor stage needs to
+ * refer to the record in order to perform a write).
+ */
+class SortStageSimple final : public SortStage {
+public:
+    SortStageSimple(boost::intrusive_ptr<ExpressionContext> expCtx,
+                    WorkingSet* ws,
+                    SortPattern sortPattern,
+                    uint64_t limit,
+                    uint64_t maxMemoryUsageBytes,
+                    bool addSortKeyMetadata,
+                    std::unique_ptr<PlanStage> child);
 
-        //
-        // Stats
-        //
+    void spool(WorkingSetID wsid) final;
 
-        CommonStats _commonStats;
-        SortStats _specificStats;
+    void loadingDone() final;
 
-        // The usage in bytes of all bufered data that we're sorting.
-        size_t _memUsage;
-    };
+    StageState unspool(WorkingSetID* out) final;
 
-    // Parameters that must be provided to a SortStage
-    class SortStageParams {
-    public:
-        SortStageParams() : hasBounds(false) { }
+    StageType stageType() const final {
+        return STAGE_SORT_SIMPLE;
+    }
 
-        // How we're sorting.
-        BSONObj pattern;
+    bool isEOF() const final {
+        return _sortExecutor.isEOF();
+    }
 
-        IndexBounds bounds;
+    const SpecificStats* getSpecificStats() const final {
+        return &_sortExecutor.stats();
+    }
 
-        bool hasBounds;
-
-        // TODO: Implement this.
-        // Must be >= 0.  Equal to 0 for no limit.
-        // int limit;
-    };
+private:
+    SortExecutor<BSONObj> _sortExecutor;
+};
 
 }  // namespace mongo

@@ -1,217 +1,225 @@
-/* Copyright 2013 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/util/net/ssl_options.h"
 
 #include <boost/filesystem/operations.hpp>
 
 #include "mongo/base/status.h"
+#include "mongo/config.h"
 #include "mongo/db/server_options.h"
+#include "mongo/util/ctype.h"
+#include "mongo/util/hex.h"
 #include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/text.h"
+
+#if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
+#include <openssl/ssl.h>
+#endif  // #ifdef MONGO_CONFIG_SSL
 
 namespace mongo {
 
-    Status addSSLServerOptions(moe::OptionSection* options) {
-        options->addOptionChaining("ssl.sslOnNormalPorts", "sslOnNormalPorts", moe::Switch,
-                "use ssl on configured ports");
+using std::string;
 
-        options->addOptionChaining("ssl.mode", "sslMode", moe::String,
-                "set the SSL operation mode (noSSL|acceptSSL|sendAcceptSSL|sslOnly)");
+SSLParams sslGlobalParams;
 
-        options->addOptionChaining("ssl.PEMKeyFile", "sslPEMKeyFile", moe::String,
-                "PEM file for ssl");
+namespace {
+std::vector<uint8_t> hexToVector(StringData hex) {
+    try {
+        std::string data = hexblob::decode(hex);
+        return std::vector<uint8_t>(data.begin(), data.end());
+    } catch (const ExceptionFor<ErrorCodes::FailedToParse>&) {
+        if (std::any_of(hex.begin(), hex.end(), [](char c) { return !ctype::isXdigit(c); })) {
+            uasserted(ErrorCodes::BadValue, "Not a valid hex string");
+        }
+        if (hex.size() % 2) {
+            uasserted(ErrorCodes::BadValue, "Not an even number of hexits");
+        }
+        throw;
+    }
+}
+}  // namespace
 
-        options->addOptionChaining("ssl.PEMKeyPassword", "sslPEMKeyPassword", moe::String,
-                "PEM file password")
-                                  .setImplicit(moe::Value(std::string("")));
-
-        options->addOptionChaining("ssl.clusterFile", "sslClusterFile", moe::String,
-                "Key file for internal SSL authentication");
-
-        options->addOptionChaining("ssl.clusterPassword", "sslClusterPassword", moe::String,
-                "Internal authentication key file password")
-                                  .setImplicit(moe::Value(std::string("")));
-
-        options->addOptionChaining("ssl.CAFile", "sslCAFile", moe::String,
-                "Certificate Authority file for SSL");
-
-        options->addOptionChaining("ssl.CRLFile", "sslCRLFile", moe::String,
-                "Certificate Revocation List file for SSL");
-
-        options->addOptionChaining("ssl.weakCertificateValidation", "sslWeakCertificateValidation",
-                moe::Switch, "allow client to connect without presenting a certificate");
-
-        options->addOptionChaining("ssl.FIPSMode", "sslFIPSMode", moe::Switch,
-                "activate FIPS 140-2 mode at startup");
-
-
+Status storeSSLDisabledProtocols(const std::string& disabledProtocols,
+                                 SSLDisabledProtocolsMode mode /* =kStandardFormat */) {
+    if (disabledProtocols == "none") {
+        // Allow overriding the default behavior below of implicitly disabling TLS 1.0 and TLS 1.1.
         return Status::OK();
     }
 
-    Status addSSLClientOptions(moe::OptionSection* options) {
-        options->addOptionChaining("ssl", "ssl", moe::Switch, "use SSL for all connections");
+    // The disabledProtocols field is composed of a comma separated list of protocols to
+    // disable. First, tokenize the field.
+    const auto tokens = StringSplitter::split(disabledProtocols, ",");
 
-        options->addOptionChaining("ssl.CAFile", "sslCAFile", moe::String,
-                "Certificate Authority file for SSL");
+    // All universally accepted tokens, and their corresponding enum representation.
+    const std::map<std::string, SSLParams::Protocols> validConfigs{
+        {"TLS1_0", SSLParams::Protocols::TLS1_0},
+        {"TLS1_1", SSLParams::Protocols::TLS1_1},
+        {"TLS1_2", SSLParams::Protocols::TLS1_2},
+        {"TLS1_3", SSLParams::Protocols::TLS1_3},
+    };
 
-        options->addOptionChaining("ssl.PEMKeyFile", "sslPEMKeyFile", moe::String,
-                "PEM certificate/key file for SSL");
+    // These noTLS* tokens exist for backwards compatibility.
+    const std::map<std::string, SSLParams::Protocols> validNoConfigs{
+        {"noTLS1_0", SSLParams::Protocols::TLS1_0},
+        {"noTLS1_1", SSLParams::Protocols::TLS1_1},
+        {"noTLS1_2", SSLParams::Protocols::TLS1_2},
+        {"noTLS1_3", SSLParams::Protocols::TLS1_3},
+    };
 
-        options->addOptionChaining("ssl.PEMKeyPassword", "sslPEMKeyPassword", moe::String,
-                "password for key in PEM file for SSL");
+    // Map the tokens to their enum values, and push them onto the list of disabled protocols.
+    for (const std::string& token : tokens) {
+        auto mappedToken = validConfigs.find(token);
+        if (mappedToken != validConfigs.end()) {
+            sslGlobalParams.sslDisabledProtocols.push_back(mappedToken->second);
+            continue;
+        }
 
-        options->addOptionChaining("ssl.CRLFile", "sslCRLFile", moe::String,
-                "Certificate Revocation List file for SSL");
+        if (mode == SSLDisabledProtocolsMode::kAcceptNegativePrefix) {
+            auto mappedNoToken = validNoConfigs.find(token);
+            if (mappedNoToken != validNoConfigs.end()) {
+                sslGlobalParams.sslDisabledProtocols.push_back(mappedNoToken->second);
+                continue;
+            }
+        }
 
-        options->addOptionChaining("ssl.FIPSMode", "sslFIPSMode", moe::Switch,
-                "activate FIPS 140-2 mode at startup");
+        return Status(ErrorCodes::BadValue, "Unrecognized disabledProtocols '" + token + "'");
+    }
 
+    return Status::OK();
+}
 
+Status parseCertificateSelector(SSLParams::CertificateSelector* selector,
+                                StringData name,
+                                StringData value) {
+    selector->subject.clear();
+    selector->thumbprint.clear();
+
+    const auto delim = value.find('=');
+    if (delim == std::string::npos) {
+        return {ErrorCodes::BadValue,
+                str::stream() << "Certificate selector for '" << name
+                              << "' must be a key=value pair"};
+    }
+
+    auto key = value.substr(0, delim);
+    if (key == "subject") {
+        selector->subject = value.substr(delim + 1).toString();
         return Status::OK();
     }
 
-    Status storeSSLServerOptions(const moe::Environment& params) {
-
-        if (params.count("ssl.mode")) {
-            std::string sslModeParam = params["ssl.mode"].as<string>();
-            if (sslModeParam == "noSSL") {
-                sslGlobalParams.sslMode.store(SSLGlobalParams::SSLMode_noSSL);
-            }
-            else if (sslModeParam == "acceptSSL") {
-                sslGlobalParams.sslMode.store(SSLGlobalParams::SSLMode_acceptSSL);
-            }
-            else if (sslModeParam == "sendAcceptSSL") {
-                sslGlobalParams.sslMode.store(SSLGlobalParams::SSLMode_sendAcceptSSL);
-            }
-            else if (sslModeParam == "sslOnly") {
-                sslGlobalParams.sslMode.store(SSLGlobalParams::SSLMode_sslOnly);
-            }
-            else {
-                return Status(ErrorCodes::BadValue, 
-                              "unsupported value for sslMode " + sslModeParam );
-            }
-        }
-
-        if (params.count("ssl.PEMKeyFile")) {
-            sslGlobalParams.sslPEMKeyFile = boost::filesystem::absolute(
-                                        params["ssl.PEMKeyFile"].as<string>()).generic_string();
-        }
-
-        if (params.count("ssl.PEMKeyPassword")) {
-            sslGlobalParams.sslPEMKeyPassword = params["ssl.PEMKeyPassword"].as<string>();
-        }
-
-        if (params.count("ssl.clusterFile")) {
-            sslGlobalParams.sslClusterFile = boost::filesystem::absolute(
-                                         params["ssl.clusterFile"].as<string>()).generic_string();
-        }
-
-        if (params.count("ssl.clusterPassword")) {
-            sslGlobalParams.sslClusterPassword = params["ssl.clusterPassword"].as<string>();
-        }
-
-        if (params.count("ssl.CAFile")) {
-            sslGlobalParams.sslCAFile = boost::filesystem::absolute(
-                                         params["ssl.CAFile"].as<std::string>()).generic_string();
-        }
-
-        if (params.count("ssl.CRLFile")) {
-            sslGlobalParams.sslCRLFile = boost::filesystem::absolute(
-                                         params["ssl.CRLFile"].as<std::string>()).generic_string();
-        }
-
-        if (params.count("ssl.weakCertificateValidation")) {
-            sslGlobalParams.sslWeakCertificateValidation = true;
-        }
-        if (params.count("ssl.sslOnNormalPorts")) {
-            if (params.count("ssl.mode")) {
-                    return Status(ErrorCodes::BadValue, 
-                                  "can't have both sslMode and sslOnNormalPorts");
-            }
-            else {
-                sslGlobalParams.sslMode.store(SSLGlobalParams::SSLMode_sslOnly);
-            }
-        }
-
-        if (sslGlobalParams.sslMode.load() != SSLGlobalParams::SSLMode_noSSL) {
-            if (sslGlobalParams.sslPEMKeyFile.size() == 0) {
-                return Status(ErrorCodes::BadValue,
-                              "need sslPEMKeyFile when SSL is enabled");
-            }
-            if (sslGlobalParams.sslWeakCertificateValidation &&
-                sslGlobalParams.sslCAFile.empty()) {
-                return Status(ErrorCodes::BadValue,
-                              "need sslCAFile with sslWeakCertificateValidation");
-            }
-            if (!sslGlobalParams.sslCRLFile.empty() &&
-                sslGlobalParams.sslCAFile.empty()) {
-                return Status(ErrorCodes::BadValue, "need sslCAFile with sslCRLFile");
-            }
-            if (params.count("ssl.FIPSMode")) {
-                sslGlobalParams.sslFIPSMode = true;
-            }
-        }
-        else if (sslGlobalParams.sslPEMKeyFile.size() ||
-                 sslGlobalParams.sslPEMKeyPassword.size() ||
-                 sslGlobalParams.sslClusterFile.size() ||
-                 sslGlobalParams.sslClusterPassword.size() ||
-                 sslGlobalParams.sslCAFile.size() ||
-                 sslGlobalParams.sslCRLFile.size() ||
-                 sslGlobalParams.sslWeakCertificateValidation ||
-                 sslGlobalParams.sslFIPSMode) {
-            return Status(ErrorCodes::BadValue,
-                          "need to enable SSL via the sslMode flag when "
-                          "using SSL configuration parameters");
-        }
-        if (serverGlobalParams.clusterAuthMode == "sendKeyFile" ||
-            serverGlobalParams.clusterAuthMode == "sendX509" ||
-            serverGlobalParams.clusterAuthMode == "x509") {
-            if (sslGlobalParams.sslMode.load() == SSLGlobalParams::SSLMode_noSSL){
-                return Status(ErrorCodes::BadValue, "need to enable SSL via the sslMode flag");
-            }
-        }
-        else if (params.count("clusterAuthMode") &&
-                 serverGlobalParams.clusterAuthMode != "keyFile") {
-            StringBuilder sb;
-            sb << "unsupported value for clusterAuthMode " << serverGlobalParams.clusterAuthMode;
-            return Status(ErrorCodes::BadValue, sb.str());
-        }
-
-        return Status::OK();
+    if (key != "thumbprint") {
+        return {ErrorCodes::BadValue,
+                str::stream() << "Unknown certificate selector property for '" << name << "': '"
+                              << key << "'"};
     }
 
-    Status storeSSLClientOptions(const moe::Environment& params) {
-        if (params.count("ssl")) {
-            sslGlobalParams.sslMode.store(SSLGlobalParams::SSLMode_sslOnly);
-        }
-        if (params.count("ssl.PEMKeyFile")) {
-            sslGlobalParams.sslPEMKeyFile = params["ssl.PEMKeyFile"].as<std::string>();
-        }
-        if (params.count("ssl.PEMKeyPassword")) {
-            sslGlobalParams.sslPEMKeyPassword = params["ssl.PEMKeyPassword"].as<std::string>();
-        }
-        if (params.count("ssl.CAFile")) {
-            sslGlobalParams.sslCAFile = params["ssl.CAFile"].as<std::string>();
-        }
-        if (params.count("ssl.CRLFile")) {
-            sslGlobalParams.sslCRLFile = params["ssl.CRLFile"].as<std::string>();
-        }
-        if (params.count("ssl.FIPSMode")) {
-            sslGlobalParams.sslFIPSMode = true;
-        }
-        return Status::OK();
+    try {
+        selector->thumbprint = hexToVector(value.substr(delim + 1));
+    } catch (const DBException& ex) {
+        return {ErrorCodes::BadValue,
+                str::stream() << "Invalid certificate selector value for '" << name
+                              << "': " << ex.reason()};
     }
+    return Status::OK();
+}
 
-} // namespace mongo
+StatusWith<SSLParams::SSLModes> SSLParams::sslModeParse(StringData strMode) {
+    if (strMode == "disabled") {
+        return SSLParams::SSLMode_disabled;
+    } else if (strMode == "allowSSL") {
+        return SSLParams::SSLMode_allowSSL;
+    } else if (strMode == "preferSSL") {
+        return SSLParams::SSLMode_preferSSL;
+    } else if (strMode == "requireSSL") {
+        return SSLParams::SSLMode_requireSSL;
+    } else {
+        return Status(
+            ErrorCodes::BadValue,
+            str::stream()
+                << "Invalid sslMode setting '" << strMode
+                << "', expected one of: 'disabled', 'allowSSL', 'preferSSL', or 'requireSSL'");
+    }
+}
+
+StatusWith<SSLParams::SSLModes> SSLParams::tlsModeParse(StringData strMode) {
+    if (strMode == "disabled") {
+        return SSLParams::SSLMode_disabled;
+    } else if (strMode == "allowTLS") {
+        return SSLParams::SSLMode_allowSSL;
+    } else if (strMode == "preferTLS") {
+        return SSLParams::SSLMode_preferSSL;
+    } else if (strMode == "requireTLS") {
+        return SSLParams::SSLMode_requireSSL;
+    } else {
+        return Status(
+            ErrorCodes::BadValue,
+            str::stream()
+                << "Invalid tlsMode setting '" << strMode
+                << "', expected one of: 'disabled', 'allowTLS', 'preferTLS', or 'requireTLS'");
+    }
+}
+
+
+std::string SSLParams::sslModeFormat(int mode) {
+    switch (mode) {
+        case SSLParams::SSLMode_disabled:
+            return "disabled";
+        case SSLParams::SSLMode_allowSSL:
+            return "allowSSL";
+        case SSLParams::SSLMode_preferSSL:
+            return "preferSSL";
+        case SSLParams::SSLMode_requireSSL:
+            return "requireSSL";
+        default:
+            // Default case because sslMode is an AtomicWord<int> and not bound by enum rules.
+            return "unknown";
+    }
+}
+
+std::string SSLParams::tlsModeFormat(int mode) {
+    switch (mode) {
+        case SSLParams::SSLMode_disabled:
+            return "disabled";
+        case SSLParams::SSLMode_allowSSL:
+            return "allowTLS";
+        case SSLParams::SSLMode_preferSSL:
+            return "preferTLS";
+        case SSLParams::SSLMode_requireSSL:
+            return "requireTLS";
+        default:
+            // Default case because sslMode is an AtomicWord<int> and not bound by enum rules.
+            return "unknown";
+    }
+}
+
+
+}  // namespace mongo

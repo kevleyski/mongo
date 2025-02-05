@@ -11,28 +11,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "stdio.h"
-#include "time.h"
-
 #include "logging.h"
 
-namespace google_base {
-DateLogger::DateLogger() {
-#if defined(_MSC_VER)
-  _tzset();
-#endif
-}
+#include <utility>
 
-char* const DateLogger::HumanDate() {
-#if defined(_MSC_VER)
-  _strtime_s(buffer_, sizeof(buffer_));
-#else
-  time_t time_value = time(NULL);
-  struct tm now;
-  localtime_r(&time_value, &now);
-  snprintf(buffer_, sizeof(buffer_), "%02d:%02d:%02d",
-           now.tm_hour, now.tm_min, now.tm_sec);
-#endif
-  return buffer_;
-}
-}  // namespace google_base
+namespace s2_env {
+
+LoggingEnv::~LoggingEnv() = default;
+
+LogMessageSink::~LogMessageSink() = default;
+
+LogMessage::LogMessage(int verbosity)
+  : _sink(globalLoggingEnv().makeSink(verbosity)) { }
+LogMessage::LogMessage(Severity severity)
+  : _sink(globalLoggingEnv().makeSink(severity)) { }
+LogMessage::LogMessage(Severity severity, const char* file, int line)
+  : _sink(globalLoggingEnv().makeSink(severity, file, line)) { }
+
+LogMessage::~LogMessage() = default;
+
+}  // namespace s2_env

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2020-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -27,38 +28,43 @@
  */
 
 #include "mongo/db/exec/mock_stage.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/overloaded_visitor.h"  // IWYU pragma: keep
 
 namespace mongo {
 
-    MockStage::MockStage(WorkingSet* ws) : _ws(ws) { }
+MockStage::MockStage(ExpressionContext* expCtx, WorkingSet* ws)
+    : PlanStage(kStageType.rawData(), expCtx), _ws(ws) {}
 
-    PlanStage::StageState MockStage::work(WorkingSetID* out) {
-        if (isEOF()) { return PlanStage::IS_EOF; }
+std::unique_ptr<PlanStageStats> MockStage::getStats() {
+    _commonStats.isEOF = isEOF();
+    std::unique_ptr<PlanStageStats> ret =
+        std::make_unique<PlanStageStats>(_commonStats, StageType::STAGE_MOCK);
+    ret->specific = std::make_unique<MockStats>(_specificStats);
+    return ret;
+}
 
-        StageState state = _results.front();
-        _results.pop();
-
-        if (PlanStage::ADVANCED == state) {
-            // We advanced.  Put the mock obj into the working set.
-            WorkingSetID id = _ws->allocate();
-            WorkingSetMember* member = _ws->get(id);
-            *member = _members.front();
-            _members.pop();
-            *out = id;
-        }
-
-        return state;
+PlanStage::StageState MockStage::doWork(WorkingSetID* out) {
+    if (isEOF()) {
+        return PlanStage::IS_EOF;
     }
 
-    bool MockStage::isEOF() { return _results.empty(); }
+    auto nextResult = _results.front();
+    _results.pop();
 
-    void MockStage::pushBack(const PlanStage::StageState state) {
-        _results.push(state);
+    auto returnState =
+        visit(OverloadedVisitor{
+                  [](WorkingSetID wsid) -> PlanStage::StageState { return PlanStage::ADVANCED; },
+                  [](PlanStage::StageState state) -> PlanStage::StageState { return state; },
+                  [](Status status) -> PlanStage::StageState {
+                      uassertStatusOK(status);
+                      MONGO_UNREACHABLE;
+                  }},
+              nextResult);
+    if (returnState == PlanStage::ADVANCED) {
+        *out = get<WorkingSetID>(nextResult);
     }
-
-    void MockStage::pushBack(const WorkingSetMember& member) {
-        _results.push(PlanStage::ADVANCED);
-        _members.push(member);
-    }
+    return returnState;
+}
 
 }  // namespace mongo

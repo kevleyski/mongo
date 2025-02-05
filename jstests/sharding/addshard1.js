@@ -1,56 +1,90 @@
-s = new ShardingTest( "add_shard1", 1 );
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
+import {
+    moveDatabaseAndUnshardedColls
+} from "jstests/sharding/libs/move_database_and_unsharded_coll_helper.js";
 
-assert.eq( 1, s.config.shards.count(), "initial server count wrong" );
+var s = new ShardingTest({name: "add_shard1", shards: 1, useHostname: false});
 
-// create a shard and add a database; if the database is not duplicated the mongod should accepted
+// Create a shard and add a database; if the database is not duplicated the mongod should accept
 // it as shard
-conn1 = startMongodTest( 29000 );
+var rs1 = new ReplSetTest({name: "addshard1-1", host: 'localhost', nodes: 1});
+rs1.startSet({shardsvr: ""});
+rs1.initiate();
 
-db1 = conn1.getDB( "testDB" );
-numObjs = 0;
-for (i=0; i<3; i++){
-    db1.foo.save( { a : i } );
-    numObjs++;
+var db1 = rs1.getPrimary().getDB("testDB");
+
+var numObjs = 3;
+for (var i = 0; i < numObjs; i++) {
+    assert.commandWorked(db1.foo.save({a: i}));
 }
-db1.getLastError()
 
-newShard = "myShard";
-assert( s.admin.runCommand( { addshard: "localhost:29000" , name: newShard } ).ok, "did not accepted non-duplicated shard" );
+var configDB = s.s.getDB('config');
+assert.eq(null, configDB.databases.findOne({_id: 'testDB'}));
+
+var newShard = "myShard";
+assert.commandWorked(s.admin.runCommand({addShard: rs1.getURL(), name: newShard}));
+
+assert.neq(null, configDB.databases.findOne({_id: 'testDB'}));
+
+var newShardDoc = configDB.shards.findOne({_id: newShard});
+assert(newShardDoc.topologyTime instanceof Timestamp);
+
+// maxSize field is no longer supported
+var newShardMaxSize = "myShardMaxSize";
+assert.commandFailedWithCode(
+    s.admin.runCommand({addShard: rs1.getURL(), name: newShardMaxSize, maxSize: 1024}),
+    ErrorCodes.InvalidOptions);
 
 // a mongod with an existing database name should not be allowed to become a shard
-conn2 = startMongodTest( 29001 );
-db2 = conn2.getDB( "otherDB" );
-db2.foo.save( {a:1} );
-db2.getLastError()
-db3 = conn2.getDB( "testDB" );
-db3.foo.save( {a:1} );
-db3.getLastError()
+var rs2 = new ReplSetTest({name: "addshard1-2", nodes: 1});
+rs2.startSet({shardsvr: ""});
+rs2.initiate();
 
-s.config.databases.find().forEach( printjson )
-rejectedShard = "rejectedShard";
-assert( ! s.admin.runCommand( { addshard: "localhost:29001" , name : rejectedShard } ).ok, "accepted mongod with duplicate db" );
+var db2 = rs2.getPrimary().getDB("otherDB");
+assert.commandWorked(db2.foo.save({a: 1}));
 
-// check that all collection that were local to the mongod's are accessible through the mongos
-sdb1 = s.getDB( "testDB" );
-assert.eq( numObjs , sdb1.foo.count() , "wrong count for database that existed before addshard" );
-sdb2 = s.getDB( "otherDB" );
-assert.eq( 0 , sdb2.foo.count() , "database of rejected shard appears through mongos" );
+var db3 = rs2.getPrimary().getDB("testDB");
+assert.commandWorked(db3.foo.save({a: 1}));
+
+s.config.databases.find().forEach(printjson);
+
+var rejectedShard = "rejectedShard";
+assert(!s.admin.runCommand({addShard: rs2.getURL(), name: rejectedShard}).ok,
+       "accepted mongod with duplicate db");
+
+// Check that all collection that were local to the mongod's are accessible through the mongos
+var sdb1 = s.getDB("testDB");
+assert.eq(numObjs, sdb1.foo.count(), "wrong count for database that existed before addshard");
+
+var sdb2 = s.getDB("otherDB");
+assert.eq(0, sdb2.foo.count(), "database of rejected shard appears through mongos");
 
 // make sure we can move a DB from the original mongod to a previoulsy existing shard
-assert.eq( s.normalize( s.config.databases.findOne( { _id : "testDB" } ).primary ), newShard , "DB primary is wrong" );
-origShard = s.getNonPrimaries( "testDB" )[0];
-s.adminCommand( { moveprimary : "testDB" , to : origShard } );
-assert.eq( s.normalize( s.config.databases.findOne( { _id : "testDB" } ).primary ), origShard , "DB primary didn't move" );
-assert.eq( numObjs , sdb1.foo.count() , "wrong count after moving datbase that existed before addshard" );
+assert.eq(s.normalize(s.config.databases.findOne({_id: "testDB"}).primary),
+          newShard,
+          "DB primary is wrong");
+
+var origShard = s.getNonPrimaries("testDB")[0];
+moveDatabaseAndUnshardedColls(s.s.getDB("testDB"), origShard);
+
+assert.eq(s.normalize(s.config.databases.findOne({_id: "testDB"}).primary),
+          origShard,
+          "DB primary didn't move");
+assert.eq(
+    numObjs, sdb1.foo.count(), "wrong count after moving datbase that existed before addshard");
 
 // make sure we can shard the original collections
-sdb1.foo.ensureIndex( { a : 1 }, { unique : true } ) // can't shard populated collection without an index
-s.adminCommand( { enablesharding : "testDB" } );
-s.adminCommand( { shardcollection : "testDB.foo" , key: { a : 1 } } );
-s.adminCommand( { split : "testDB.foo", middle: { a : Math.floor(numObjs/2) } } );
-assert.eq( 2 , s.config.chunks.count(), "wrong chunk number after splitting collection that existed before" );
-assert.eq( numObjs , sdb1.foo.count() , "wrong count after splitting collection that existed before" );
+sdb1.foo.createIndex({a: 1}, {unique: true});  // can't shard populated collection without an index
+s.adminCommand({enablesharding: "testDB"});
+s.adminCommand({shardcollection: "testDB.foo", key: {a: 1}});
+s.adminCommand({split: "testDB.foo", middle: {a: Math.floor(numObjs / 2)}});
+assert.eq(2,
+          findChunksUtil.countChunksForNs(s.config, "testDB.foo"),
+          "wrong chunk number after splitting collection that existed before");
+assert.eq(numObjs, sdb1.foo.count(), "wrong count after splitting collection that existed before");
 
-stopMongod( 29000 );
-stopMongod( 29001 );
 s.stop();
+rs1.stopSet();
+rs2.stopSet();

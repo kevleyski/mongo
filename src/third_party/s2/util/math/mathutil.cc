@@ -16,19 +16,6 @@ using std::vector;
 #include "base/integral_types.h"
 #include "base/logging.h"
 
-  template <class IntOut, class FloatIn>
-  IntOut MathUtil::Round(FloatIn x) {
-    COMPILE_ASSERT(!MathLimits<FloatIn>::kIsInteger, FloatIn_is_integer);
-    COMPILE_ASSERT(MathLimits<IntOut>::kIsInteger, IntOut_is_not_integer);
-
-    // We don't use sgn(x) below because there is no need to distinguish the
-    // (x == 0) case.  Also note that there are specialized faster versions
-    // of this function for Intel processors at the bottom of this file.
-    return static_cast<IntOut>(x < 0 ? (x - 0.5) : (x + 0.5));
-  }
-
-template int MathUtil::Round<int,double>(double x);
-
 MathUtil::QuadraticRootType MathUtil::RealRootsForQuadratic(long double a,
                                                         long double b,
                                                         long double c,
@@ -117,8 +104,16 @@ bool MathUtil::RealRootsForCubic(long double const a,
     return true;
   }
 
+// Disable error about fabs causing truncation of value because
+// it takes a double instead of a long double (Clang 3.5+)
+// See SERVER-15183
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wabsolute-value"
+
   long double const A =
     -sgn(R) * pow(fabs(R) + sqrt(R_squared - Q_cubed), 1.0/3.0L);
+
+#pragma clang diagnostic pop
 
   if (A != 0.0) {  // in which case, B from NR is zero
     *r1 = A + Q / A - a_third;

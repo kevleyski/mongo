@@ -15,6 +15,8 @@ using std::reverse;
 #include <functional>
 using std::less;
 
+#include <mutex>
+
 #include <queue>
 using std::priority_queue;
 
@@ -26,7 +28,6 @@ using std::vector;
 #include "s2.h"
 #include "s2cap.h"
 #include "s2cellunion.h"
-#include "mongo/base/init.h"
 
 // Define storage for header file constants (the values are not needed here).
 int const S2RegionCoverer::kDefaultMaxCells = 8;
@@ -44,15 +45,13 @@ struct S2RegionCoverer::CompareQueueEntries : public less<QueueEntry> {
 
 static S2Cell face_cells[6];
 
-static void Init() {
-  for (int face = 0; face < 6; ++face) {
-    face_cells[face] = S2Cell::FromFacePosLevel(face, 0, 0);
-  }
-}
-
-MONGO_INITIALIZER_WITH_PREREQUISITES(S2RegionCovererInit, ("S2CellIdInit"))(mongo::InitializerContext *context) {
-    Init();
-    return mongo::Status::OK();
+static std::once_flag flag;
+static void MaybeInit() {
+  std::call_once(flag, []{
+    for (int face = 0; face < 6; ++face) {
+      face_cells[face] = S2Cell::FromFacePosLevel(face, 0, 0);
+    }
+  });
 }
 
 S2RegionCoverer::S2RegionCoverer() :
@@ -112,8 +111,9 @@ S2RegionCoverer::Candidate* S2RegionCoverer::NewCandidate(S2Cell const& cell) {
   if (!is_terminal) {
     size += sizeof(Candidate*) << max_children_shift();
   }
-  Candidate* candidate = static_cast<Candidate*>(malloc(size));
-  memset(candidate, 0, size);
+  void* candidateStorage = malloc(size);
+  memset(candidateStorage, 0, size);
+  Candidate* candidate = new(candidateStorage) Candidate;
   candidate->cell = cell;
   candidate->is_terminal = is_terminal;
   ++candidates_created_counter_;
@@ -224,6 +224,7 @@ void S2RegionCoverer::GetInitialCandidates() {
     }
   }
   // Default: start with all six cube faces.
+  MaybeInit();
   for (size_t face = 0; face < 6; ++face) {
     AddCandidate(NewCandidate(face_cells[face]));
   }

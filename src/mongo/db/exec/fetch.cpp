@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,196 +27,185 @@
  *    it in the license file.
  */
 
-#include "mongo/db/exec/fetch.h"
+#include <memory>
+#include <utility>
+#include <vector>
 
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/pdfile.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/db/query/plan_executor_impl.h"
+#include "mongo/util/assert_util.h"
+
+namespace {
+MONGO_FAIL_POINT_DEFINE(hangFetchDoWork);
+}  // namespace
 
 namespace mongo {
 
-    // Some fail points for testing.
-    MONGO_FP_DECLARE(fetchInMemoryFail);
-    MONGO_FP_DECLARE(fetchInMemorySucceed);
+using std::unique_ptr;
 
-    FetchStage::FetchStage(WorkingSet* ws, PlanStage* child, const MatchExpression* filter)
-        : _ws(ws), _child(child), _filter(filter), _idBeingPagedIn(WorkingSet::INVALID_ID) { }
+// static
+const char* FetchStage::kStageType = "FETCH";
 
-    FetchStage::~FetchStage() { }
+FetchStage::FetchStage(ExpressionContext* expCtx,
+                       WorkingSet* ws,
+                       std::unique_ptr<PlanStage> child,
+                       const MatchExpression* filter,
+                       VariantCollectionPtrOrAcquisition collection)
+    : RequiresCollectionStage(kStageType, expCtx, collection),
+      _ws(ws),
+      _filter((filter && !filter->isTriviallyTrue()) ? filter : nullptr),
+      _idRetrying(WorkingSet::INVALID_ID) {
+    _children.emplace_back(std::move(child));
+}
 
-    bool FetchStage::isEOF() {
-        if (WorkingSet::INVALID_ID != _idBeingPagedIn) {
-            // We asked our parent for a page-in but he didn't get back to us.  We still need to
-            // return the result that _idBeingPagedIn refers to.
-            return false;
-        }
+FetchStage::~FetchStage() {}
 
-        return _child->isEOF();
+bool FetchStage::isEOF() const {
+    if (WorkingSet::INVALID_ID != _idRetrying) {
+        // We have a working set member that we need to retry.
+        return false;
     }
 
-    bool recordInMemory(const char* data) {
-        if (MONGO_FAIL_POINT(fetchInMemoryFail)) {
-            return false;
-        }
+    return child()->isEOF();
+}
 
-        if (MONGO_FAIL_POINT(fetchInMemorySucceed)) {
-            return true;
-        }
-
-        return Record::likelyInPhysicalMemory(data);
+PlanStage::StageState FetchStage::doWork(WorkingSetID* out) {
+    if (MONGO_unlikely(hangFetchDoWork.shouldFail())) {
+        hangFetchDoWork.pauseWhileSet();
     }
 
-    PlanStage::StageState FetchStage::work(WorkingSetID* out) {
-        ++_commonStats.works;
-
-        if (isEOF()) { return PlanStage::IS_EOF; }
-
-        // If we asked our parent for a page-in last time work(...) was called, finish the fetch.
-        if (WorkingSet::INVALID_ID != _idBeingPagedIn) {
-            return fetchCompleted(out);
-        }
-
-        // If we're here, we're not waiting for a DiskLoc to be fetched.  Get another to-be-fetched
-        // result from our child.
-        WorkingSetID id;
-        StageState status = _child->work(&id);
-
-        if (PlanStage::ADVANCED == status) {
-            WorkingSetMember* member = _ws->get(id);
-
-            // If there's an obj there, there is no fetching to perform.
-            if (member->hasObj()) {
-                ++_specificStats.alreadyHasObj;
-                return returnIfMatches(member, id, out);
-            }
-
-            // We need a valid loc to fetch from and this is the only state that has one.
-            verify(WorkingSetMember::LOC_AND_IDX == member->state);
-            verify(member->hasLoc());
-
-            Record* record = member->loc.rec();
-            const char* data = record->dataNoThrowing();
-
-            if (!recordInMemory(data)) {
-                // member->loc points to a record that's NOT in memory.  Pass a fetch request up.
-                verify(WorkingSet::INVALID_ID == _idBeingPagedIn);
-                _idBeingPagedIn = id;
-                *out = id;
-                ++_commonStats.needFetch;
-                return PlanStage::NEED_FETCH;
-            }
-            else {
-                // Don't need index data anymore as we have an obj.
-                member->keyData.clear();
-                member->obj = BSONObj(data);
-                member->state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
-                return returnIfMatches(member, id, out);
-            }
-        }
-        else {
-            if (PlanStage::NEED_FETCH == status) {
-                *out = id;
-                ++_commonStats.needFetch;
-            }
-            else if (PlanStage::NEED_TIME == status) {
-                ++_commonStats.needTime;
-            }
-            return status;
-        }
+    if (isEOF()) {
+        return PlanStage::IS_EOF;
     }
 
-    void FetchStage::prepareToYield() {
-        ++_commonStats.yields;
-        _child->prepareToYield();
+    // Either retry the last WSM we worked on or get a new one from our child.
+    WorkingSetID id;
+    StageState status;
+    if (_idRetrying == WorkingSet::INVALID_ID) {
+        status = child()->work(&id);
+    } else {
+        status = ADVANCED;
+        id = _idRetrying;
+        _idRetrying = WorkingSet::INVALID_ID;
     }
 
-    void FetchStage::recoverFromYield() {
-        ++_commonStats.unyields;
-        _child->recoverFromYield();
-    }
+    if (PlanStage::ADVANCED == status) {
+        WorkingSetMember* member = _ws->get(id);
 
-    void FetchStage::invalidate(const DiskLoc& dl) {
-        ++_commonStats.invalidates;
+        // If there's an obj there, there is no fetching to perform.
+        if (member->hasObj()) {
+            ++_specificStats.alreadyHasObj;
+        } else {
+            // We need a valid RecordId to fetch from and this is the only state that has one.
+            MONGO_verify(WorkingSetMember::RID_AND_IDX == member->getState());
+            MONGO_verify(member->hasRecordId());
 
-        _child->invalidate(dl);
+            const auto ret = handlePlanStageYield(
+                expCtx(),
+                "FetchStage",
+                [&] {
+                    const auto& coll = collectionPtr();
+                    if (!_cursor)
+                        _cursor = coll->getCursor(opCtx());
 
-        // If we're holding on to an object that we're waiting for the runner to page in...
-        if (WorkingSet::INVALID_ID != _idBeingPagedIn) {
-            WorkingSetMember* member = _ws->get(_idBeingPagedIn);
-            // If we're paging something in it must have a DiskLoc.
-            verify(member->hasLoc());
-            // The DiskLoc is about to perish so we force a fetch of the data.
-            if (member->loc == dl) {
-                // TODO: Do we ever want a third state, _idBeingPagedIn is a valid WSID but doesn't
-                // have a DiskLoc?
-                _ws->free(_idBeingPagedIn);
-                _idBeingPagedIn = WorkingSet::INVALID_ID;
+                    if (!WorkingSetCommon::fetch(
+                            opCtx(), _ws, id, _cursor.get(), coll, coll->ns())) {
+                        _ws->free(id);
+                        return NEED_TIME;
+                    }
+                    return PlanStage::ADVANCED;
+                },
+                [&] {
+                    // yieldHandler
+                    // Ensure that the BSONObj underlying the WorkingSetMember is owned because it
+                    // may be freed when we yield.
+                    member->makeObjOwnedIfNeeded();
+                    _idRetrying = id;
+                    *out = WorkingSet::INVALID_ID;
+                });
+            if (ret != PlanStage::ADVANCED) {
+                return ret;
             }
         }
+        return returnIfMatches(member, id, out);
+    } else if (PlanStage::NEED_YIELD == status) {
+        *out = id;
     }
 
-    PlanStage::StageState FetchStage::fetchCompleted(WorkingSetID* out) {
-        WorkingSetMember* member = _ws->get(_idBeingPagedIn);
+    return status;
+}
 
-        // The DiskLoc we're waiting to page in was invalidated (forced fetch).  Test for
-        // matching and maybe pass it up.
-        if (member->state == WorkingSetMember::OWNED_OBJ) {
-            WorkingSetID memberID = _idBeingPagedIn;
-            _idBeingPagedIn = WorkingSet::INVALID_ID;
-            return returnIfMatches(member, memberID, out);
-        }
+void FetchStage::doSaveStateRequiresCollection() {
+    if (_cursor) {
+        _cursor->saveUnpositioned();
+    }
+}
 
-        // Assume that the caller has fetched appropriately.
-        // TODO: Do we want to double-check the runner?  Not sure how reliable likelyInMemory is
-        // on all platforms.
-        verify(member->hasLoc());
-        verify(!member->hasObj());
+void FetchStage::doRestoreStateRequiresCollection() {
+    if (_cursor) {
+        const bool couldRestore = _cursor->restore();
+        uassert(50982, "could not restore cursor for FETCH stage", couldRestore);
+    }
+}
 
-        // Make the (unowned) object.
-        Record* record = member->loc.rec();
-        const char* data = record->dataNoThrowing();
-        member->obj = BSONObj(data);
+void FetchStage::doDetachFromOperationContext() {
+    if (_cursor)
+        _cursor->detachFromOperationContext();
+}
 
-        // Don't need index data anymore as we have an obj.
-        member->keyData.clear();
-        member->state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
-        verify(!member->obj.isOwned());
+void FetchStage::doReattachToOperationContext() {
+    if (_cursor)
+        _cursor->reattachToOperationContext(opCtx());
+}
 
-        // Return the obj if it passes our filter.
-        WorkingSetID memberID = _idBeingPagedIn;
-        _idBeingPagedIn = WorkingSet::INVALID_ID;
-        return returnIfMatches(member, memberID, out);
+PlanStage::StageState FetchStage::returnIfMatches(WorkingSetMember* member,
+                                                  WorkingSetID memberID,
+                                                  WorkingSetID* out) {
+    // We consider "examining a document" to be every time that we pass a document through
+    // a filter by calling Filter::passes(...) below. Therefore, the 'docsExamined' metric
+    // is not always equal to the number of documents that were fetched from the collection.
+    // In particular, we can sometimes generate plans which have two fetch stages. The first
+    // one actually grabs the document from the collection, and the second passes the
+    // document through a second filter.
+    //
+    // One common example of this is geoNear. Suppose that a geoNear plan is searching an
+    // annulus to find 2dsphere-indexed documents near some point (x, y) on the globe.
+    // After fetching documents within geo hashes that intersect this annulus, the docs are
+    // fetched and filtered to make sure that they really do fall into this annulus. However,
+    // the user might also want to find only those documents for which accommodationType==
+    // "restaurant". The planner will add a second fetch stage to filter by this non-geo
+    // predicate.
+    ++_specificStats.docsExamined;
+
+    if (Filter::passes(member, _filter)) {
+        *out = memberID;
+        return PlanStage::ADVANCED;
+    } else {
+        _ws->free(memberID);
+        return PlanStage::NEED_TIME;
+    }
+}
+
+unique_ptr<PlanStageStats> FetchStage::getStats() {
+    _commonStats.isEOF = isEOF();
+
+    // Add a BSON representation of the filter to the stats tree, if there is one.
+    if (_filter) {
+        _commonStats.filter = _filter->serialize();
     }
 
-    PlanStage::StageState FetchStage::returnIfMatches(WorkingSetMember* member,
-                                                      WorkingSetID memberID,
-                                                      WorkingSetID* out) {
-        if (Filter::passes(member, _filter)) {
-            if (NULL != _filter) {
-                ++_specificStats.matchTested;
-            }
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_FETCH);
+    ret->specific = std::make_unique<FetchStats>(_specificStats);
+    ret->children.emplace_back(child()->getStats());
+    return ret;
+}
 
-            *out = memberID;
-
-            ++_commonStats.advanced;
-            return PlanStage::ADVANCED;
-        }
-        else {
-            _ws->free(memberID);
-
-            ++_commonStats.needTime;
-            return PlanStage::NEED_TIME;
-        }
-    }
-
-    PlanStageStats* FetchStage::getStats() {
-        _commonStats.isEOF = isEOF();
-
-        auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_FETCH));
-        ret->specific.reset(new FetchStats(_specificStats));
-        ret->children.push_back(_child->getStats());
-        return ret.release();
-    }
+const SpecificStats* FetchStage::getSpecificStats() const {
+    return &_specificStats;
+}
 
 }  // namespace mongo

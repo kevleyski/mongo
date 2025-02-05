@@ -114,7 +114,7 @@ public:
 };
 HASH_NAMESPACE_END
 
-bool S2Polygon::IsValid(const vector<S2Loop*>& loops) {
+bool S2Polygon::IsValid(const vector<S2Loop*>& loops, string* err) {
   // If a loop contains an edge AB, then no other loop may contain AB or BA.
   if (loops.size() > 1) {
     hash_map<S2PointPair, pair<int, int> > edges;
@@ -130,6 +130,10 @@ bool S2Polygon::IsValid(const vector<S2Loop*>& loops) {
         pair<int, int> other = edges[key];
         VLOG(2) << "Duplicate edge: loop " << i << ", edge " << j
                  << " and loop " << other.first << ", edge " << other.second;
+        if (err) {
+            *err = s2_env::StringStream() << "Duplicate edge: loop " << i << ", edge " << j
+                            << " and loop " << other.first << ", edge " << other.second;
+        }
         return false;
       }
     }
@@ -140,6 +144,7 @@ bool S2Polygon::IsValid(const vector<S2Loop*>& loops) {
   for (size_t i = 0; i < loops.size(); ++i) {
     if (!loops[i]->IsNormalized()) {
       VLOG(2) << "Loop " << i << " encloses more than half the sphere";
+      if (err) *err = s2_env::StringStream() << "Loop " << i << " encloses more than half the sphere";
       return false;
     }
     for (size_t j = i + 1; j < loops.size(); ++j) {
@@ -147,6 +152,7 @@ bool S2Polygon::IsValid(const vector<S2Loop*>& loops) {
       // cases where the two boundaries cross at a shared vertex.
       if (loops[i]->ContainsOrCrosses(loops[j]) < 0) {
         VLOG(2) << "Loop " << i << " crosses loop " << j;
+        if (err) *err = s2_env::StringStream() << "Loop " << i << " crosses loop " << j;
         return false;
       }
     }
@@ -155,13 +161,13 @@ bool S2Polygon::IsValid(const vector<S2Loop*>& loops) {
   return true;
 }
 
-bool S2Polygon::IsValid() const {
+bool S2Polygon::IsValid(string* err) const {
   for (int i = 0; i < num_loops(); ++i) {
-    if (!loop(i)->IsValid()) {
+    if (!loop(i)->IsValid(err)) {
       return false;
     }
   }
-  return IsValid(loops_);
+  return IsValid(loops_, err);
 }
 
 bool S2Polygon::IsValid(bool check_loops, int max_adjacent) const {
@@ -1079,7 +1085,7 @@ void S2Polygon::InitToCellUnionBorder(S2CellUnion const& cells) {
   }
 }
 
-bool S2Polygon::IsNormalized() const {
+bool S2Polygon::IsNormalized(string* err) const {
   set<S2Point> vertices;
   S2Loop* last_parent = NULL;
   for (int i = 0; i < num_loops(); ++i) {
@@ -1097,7 +1103,13 @@ bool S2Polygon::IsNormalized() const {
     for (int j = 0; j < child->num_vertices(); ++j) {
       if (vertices.count(child->vertex(j)) > 0) ++count;
     }
-    if (count > 1) return false;
+    if (count > 1) {
+      if (err) {
+        *err = s2_env::StringStream() << "Loop " << i << " shares more than one vertex"
+                        << " with its parent loop " << GetParent(i);
+      }
+      return false;
+    }
   }
   return true;
 }

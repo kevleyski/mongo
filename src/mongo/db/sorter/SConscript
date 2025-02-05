@@ -1,3 +1,13 @@
 Import("env")
 
-env.CppUnitTest('sorter_test', 'sorter_test.cpp', LIBDEPS=['$BUILD_DIR/third_party/shim_snappy'])
+env = env.Clone()
+
+env.CppUnitTest(
+    target="db_sorter_test",
+    source=[],
+)
+
+env.Benchmark(
+    target="sorter_checksum_calculator_bm",
+    source=[],
+)

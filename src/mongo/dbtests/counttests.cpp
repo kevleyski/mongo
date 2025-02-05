@@ -1,259 +1,202 @@
-// counttests.cpp : count.{h,cpp} unit tests.
-
 /**
- *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#include <boost/thread/thread.hpp>
+#include <memory>
+#include <string>
+#include <vector>
 
-#include "mongo/db/cursor.h"
-#include "mongo/db/db.h"
-#include "mongo/db/json.h"
-#include "mongo/db/ops/count.h"
-#include "mongo/db/structure/collection.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/client.h"
+#include "mongo/db/collection_crud/collection_write_path.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
-#include "mongo/dbtests/dbtests.h"
-
+namespace mongo {
 namespace CountTests {
 
-    class Base {
-        Lock::DBWrite lk;
-        Client::Context _context;
-        Database* _database;
-        Collection* _collection;
-    public:
-        Base() : lk(ns()), _context( ns() ) {
-            _database = _context.db();
-            _collection = _database->getCollection( ns() );
-            if ( _collection ) {
-                _database->dropCollection( ns() );
-            }
-            _collection = _database->createCollection( ns(), false, NULL, true );
+class Base {
+public:
+    Base() : _lk(&_opCtx, nss().dbName(), MODE_X), _context(&_opCtx, nss()), _client(&_opCtx) {
+        _database = _context.db();
 
-            addIndex( fromjson( "{\"a\":1}" ) );
-        }
-        ~Base() {
-            try {
-                uassertStatusOK( _database->dropCollection( ns() ) );
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+
+            CollectionWriter writer{&_opCtx, nss()};
+            auto collection = writer.getWritableCollection(&_opCtx);
+            if (collection) {
+                _database->dropCollection(&_opCtx, nss()).transitional_ignore();
             }
-            catch ( ... ) {
-                FAIL( "Exception while cleaning up collection" );
-            }
+            collection = _database->createCollection(&_opCtx, nss());
+
+            IndexCatalog* indexCatalog = collection->getIndexCatalog();
+            auto indexSpec = BSON("v" << static_cast<int>(IndexDescriptor::kLatestIndexVersion)
+                                      << "key" << BSON("a" << 1) << "name"
+                                      << "a_1");
+            uassertStatusOK(
+                indexCatalog->createIndexOnEmptyCollection(&_opCtx, collection, indexSpec));
+
+            wunit.commit();
+
+            _collection = CollectionPtr(collection);
         }
-    protected:
-        static const char *ns() {
-            return "unittests.counttests";
+    }
+
+    ~Base() {
+        try {
+            WriteUnitOfWork wunit(&_opCtx);
+            uassertStatusOK(_database->dropCollection(&_opCtx, nss()));
+            wunit.commit();
+        } catch (...) {
+            FAIL("Exception while cleaning up collection");
         }
-        void addIndex( const BSONObj &key ) {
+    }
+
+protected:
+    static const char* ns() {
+        return "unittests.counttests";
+    }
+
+    static NamespaceString nss() {
+        return NamespaceString::createNamespaceString_forTest(ns());
+    }
+
+    void insert(const char* s) {
+        WriteUnitOfWork wunit(&_opCtx);
+        const BSONObj o = fromjson(s);
+        OpDebug* const nullOpDebug = nullptr;
+
+        if (o["_id"].eoo()) {
             BSONObjBuilder b;
-            b.append( "name", key.firstElementFieldName() );
-            b.append( "ns", ns() );
-            b.append( "key", key );
-            BSONObj o = b.done();
-            Status s = _collection->getIndexCatalog()->createIndex( o, false );
-            uassertStatusOK( s );
+            OID oid;
+            oid.init();
+            b.appendOID("_id", &oid);
+            b.appendElements(o);
+            collection_internal::insertDocument(
+                &_opCtx, _collection, InsertStatement(b.obj()), nullOpDebug, false)
+                .transitional_ignore();
+        } else {
+            collection_internal::insertDocument(
+                &_opCtx, _collection, InsertStatement(o), nullOpDebug, false)
+                .transitional_ignore();
         }
-        void insert( const char *s ) {
-            insert( fromjson( s ) );
-        }
-        void insert( const BSONObj &o ) {
-            if ( o["_id"].eoo() ) {
-                BSONObjBuilder b;
-                OID oid;
-                oid.init();
-                b.appendOID( "_id", &oid );
-                b.appendElements( o );
-                _collection->insertDocument( b.obj(), false );
-            }
-            else {
-                _collection->insertDocument( o, false );
-            }
-        }
-        static BSONObj countCommand( const BSONObj &query ) {
-            return BSON( "query" << query );
-        }
-    };
-    
-    class Basic : public Base {
-    public:
-        void run() {
-            insert( "{\"a\":\"b\"}" );
-            BSONObj cmd = fromjson( "{\"query\":{}}" );
-            string err;
-            int errCode;
-            ASSERT_EQUALS( 1, runCount( ns(), cmd, err, errCode ) );
-        }
-    };
-    
-    class Query : public Base {
-    public:
-        void run() {
-            insert( "{\"a\":\"b\"}" );
-            insert( "{\"a\":\"b\",\"x\":\"y\"}" );
-            insert( "{\"a\":\"c\"}" );
-            BSONObj cmd = fromjson( "{\"query\":{\"a\":\"b\"}}" );
-            string err;
-            int errCode;
-            ASSERT_EQUALS( 2, runCount( ns(), cmd, err, errCode ) );
-        }
-    };
-    
-    class Fields : public Base {
-    public:
-        void run() {
-            insert( "{\"a\":\"b\"}" );
-            insert( "{\"c\":\"d\"}" );
-            BSONObj cmd = fromjson( "{\"query\":{},\"fields\":{\"a\":1}}" );
-            string err;
-            int errCode;
-            ASSERT_EQUALS( 2, runCount( ns(), cmd, err, errCode ) );
-        }
-    };
-    
-    class QueryFields : public Base {
-    public:
-        void run() {
-            insert( "{\"a\":\"b\"}" );
-            insert( "{\"a\":\"c\"}" );
-            insert( "{\"d\":\"e\"}" );
-            BSONObj cmd = fromjson( "{\"query\":{\"a\":\"b\"},\"fields\":{\"a\":1}}" );
-            string err;
-            int errCode;
-            ASSERT_EQUALS( 1, runCount( ns(), cmd, err, errCode ) );
-        }
-    };
-    
-    class IndexedRegex : public Base {
-    public:
-        void run() {
-            insert( "{\"a\":\"b\"}" );
-            insert( "{\"a\":\"c\"}" );
-            BSONObj cmd = fromjson( "{\"query\":{\"a\":/^b/}}" );
-            string err;
-            int errCode;
-            ASSERT_EQUALS( 1, runCount( ns(), cmd, err, errCode ) );
-        }
-    };
+        wunit.commit();
+    }
 
-    /** Set a value or await an expected value. */
-    class PendingValue {
-    public:
-        PendingValue( int initialValue ) :
-            _value( initialValue ),
-            _mutex( "CountTests::PendingValue::_mutex" ) {
-        }
-        void set( int newValue ) {
-            scoped_lock lk( _mutex );
-            _value = newValue;
-            _condition.notify_all();
-        }
-        void await( int expectedValue ) const {
-            scoped_lock lk( _mutex );
-            while( _value != expectedValue ) {
-                _condition.wait( lk.boost() );
-            }
-        }
-    private:
-        int _value;
-        mutable mongo::mutex _mutex;
-        mutable boost::condition _condition;
-    };
+    const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
+    OperationContext& _opCtx = *_opCtxPtr;
+    Lock::DBLock _lk;
 
-    /** A writer client will be registered for the lifetime of an object of this class. */
-    class WriterClientScope {
-    public:
-        WriterClientScope() :
-            _state( Initial ),
-            _dummyWriter( boost::bind( &WriterClientScope::runDummyWriter, this ) ) {
-            _state.await( Ready );
-        }
-        ~WriterClientScope() {
-            // Terminate the writer thread even on exception.
-            _state.set( Finished );
-            DESTRUCTOR_GUARD( _dummyWriter.join() );
-        }
-    private:
-        enum State {
-            Initial,
-            Ready,
-            Finished
-        };
-        void runDummyWriter() {
-            Client::initThread( "dummy writer" );
-            scoped_ptr<Acquiring> a( new Acquiring( 0 , cc().lockState() ) );
-            _state.set( Ready );
-            _state.await( Finished );
-            a.reset(0);
-            cc().shutdown();
-        }
-        PendingValue _state;
-        boost::thread _dummyWriter;
-    };
-    
-    /**
-     * The runCount() function yields deterministically with sufficient cursor iteration and a
-     * mutually exclusive thread awaiting its mutex.  SERVER-5428
-     */
-    class Yield : public Base {
-    public:
-        void run() {
-            // Insert enough documents that counting them will exceed the iteration threshold
-            // to trigger a yield.
-            for( int i = 0; i < 1000; ++i ) {
-                insert( BSON( "a" << 1 ) );
-            }
-            
-            // Call runCount() under a read lock.
-            dbtemprelease release;
-            Client::ReadContext ctx( ns() );
+    OldClientContext _context;
 
-            int numYieldsBeforeCount = numYields();
-            
-            string err;
-            int errCode;
-            ASSERT_EQUALS( 1000, runCount( ns(), countCommand( BSON( "a" << 1 ) ), err, errCode ) );
-            ASSERT_EQUALS( "", err );
+    Database* _database;
+    CollectionPtr _collection;
 
-            int numYieldsAfterCount = numYields();
-            int numYieldsDuringCount = numYieldsAfterCount - numYieldsBeforeCount;
+    DBDirectClient _client;
+};
 
-            // The runCount() function yieled.
-            ASSERT_NOT_EQUALS( 0, numYieldsDuringCount );
-            ASSERT( 0 < numYieldsDuringCount );
-        }
-    private:
-        int numYields() const {
-            return cc().curop()->info()[ "numYields" ].Int();
-        }
-        // A writer client is registered while the test runs, causing runCount() to yield.
-        WriterClientScope _writer;
-    };
-    
-    class All : public Suite {
-    public:
-        All() : Suite( "count" ) {
-        }
-        
-        void setupTests() {
-            add<Basic>();
-            add<Query>();
-            add<Fields>();
-            add<QueryFields>();
-            add<IndexedRegex>();
-            add<Yield>();
-        }
-    } myall;
-    
-} // namespace CountTests
+class Basic : public Base {
+public:
+    void run() {
+        insert("{\"a\":\"b\"}");
+        insert("{\"c\":\"d\"}");
+        ASSERT_EQUALS(2ULL, _client.count(nss(), fromjson("{}")));
+    }
+};
+
+class Query : public Base {
+public:
+    void run() {
+        insert("{\"a\":\"b\"}");
+        insert("{\"a\":\"b\",\"x\":\"y\"}");
+        insert("{\"a\":\"c\"}");
+        ASSERT_EQUALS(2ULL, _client.count(nss(), fromjson("{\"a\":\"b\"}")));
+    }
+};
+
+class QueryFields : public Base {
+public:
+    void run() {
+        insert("{\"a\":\"b\"}");
+        insert("{\"a\":\"c\"}");
+        insert("{\"d\":\"e\"}");
+        ASSERT_EQUALS(1ULL, _client.count(nss(), fromjson("{\"a\":\"b\"}")));
+    }
+};
+
+class IndexedRegex : public Base {
+public:
+    void run() {
+        insert("{\"a\":\"c\"}");
+        insert("{\"a\":\"b\"}");
+        insert("{\"a\":\"d\"}");
+        ASSERT_EQUALS(1ULL, _client.count(nss(), fromjson("{\"a\":/^b/}")));
+    }
+};
+
+class All : public unittest::OldStyleSuiteSpecification {
+public:
+    All() : OldStyleSuiteSpecification("count") {}
+
+    void setupTests() override {
+        add<Basic>();
+        add<Query>();
+        add<QueryFields>();
+        add<IndexedRegex>();
+    }
+};
+
+unittest::OldStyleSuiteInitializer<All> myall;
+
+}  // namespace CountTests
+}  // namespace mongo
