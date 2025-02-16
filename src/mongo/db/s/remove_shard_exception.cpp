@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2025-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -27,43 +27,23 @@
  *    it in the license file.
  */
 
-#pragma once
-
-#include <string>
-
-#include "mongo/base/string_data.h"
-#include "mongo/bson/bsonobj.h"
-#include "mongo/db/auth/validated_tenancy_scope.h"
-#include "mongo/db/write_concern_options.h"
+#include "mongo/db/s/remove_shard_exception.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
 
 namespace mongo {
-class ShardsvrAddShard;
-class BSONObj;
-class OperationContext;
+namespace {
 
-class ShardId;
+MONGO_INIT_REGISTER_ERROR_EXTRA_INFO(RemoveShardDrainingInfo);
 
-// Contains a collection of utility functions relating to the addShard command
-namespace add_shard_util {
+}  // namespace
 
-/*
- * The _id value for shard identity documents
- */
-constexpr StringData kShardIdentityDocumentId = "shardIdentity"_sd;
+void RemoveShardDrainingInfo::serialize(BSONObjBuilder* bob) const {
+    _progress.serialize(bob);
+}
 
-/**
- * Creates an ShardsvrAddShard command object that's sent from the config server to
- * a mongod to instruct it to initialize itself as a shard in the cluster.
- */
-ShardsvrAddShard createAddShardCmd(OperationContext* opCtx, const ShardId& shardName);
+std::shared_ptr<const ErrorExtraInfo> RemoveShardDrainingInfo::parse(const BSONObj& obj) {
+    return std::make_shared<RemoveShardDrainingInfo>(
+        RemoveShardProgress::parse(IDLParserContext("RemoveShardDrainingInfo"), obj));
+}
 
-/**
- * Returns a BSON representation of an update request that can be used to insert a shardIdentity
- * doc into the shard with the given shardName (or update the shard's existing shardIdentity
- * doc's configsvrConnString if the _id, shardName, and clusterId do not conflict).
- */
-BSONObj createShardIdentityUpsertForAddShard(const ShardsvrAddShard& addShardCmd,
-                                             const WriteConcernOptions& wc);
-
-}  // namespace add_shard_util
 }  // namespace mongo
